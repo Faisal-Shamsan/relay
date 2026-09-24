@@ -1,0 +1,27 @@
+---
+description: Relay project-control rules for all work in this repository
+alwaysApply: true
+---
+
+# Relay
+
+`docs/spec.md` is authoritative. Correctness under failure outranks feature count.
+
+Before meaningful work:
+
+- Read `PROJECT_STATE.md`.
+- Read the relevant parts of `docs/spec.md`, `docs/invariants.md`, and any applicable ADR in `docs/adr/`.
+- Inspect the existing implementation before creating new structures.
+
+While working:
+
+- Stay inside the requested scope.
+- Do not implement a later roadmap phase before the current correctness gate is met.
+- Do not silently change architecture. A meaningful architectural change requires an ADR.
+- Do not add packages, migrations, or modules the current slice does not need.
+
+Before claiming completion:
+
+- Where database semantics matter, use real PostgreSQL integration tests.
+- Run the relevant tests, typecheck, lint, and build. Claim a check passed only if it was actually run successfully.
+- Update `PROJECT_STATE.md` only for work that has actually been completed.
