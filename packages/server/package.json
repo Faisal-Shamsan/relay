@@ -1,0 +1,13 @@
+{
+  "name": "relay-server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/src/index.js"
+  },
+  "dependencies": {
+    "@relay/protocol": "*",
+    "pg": "^8.14.1"
+  }
+}

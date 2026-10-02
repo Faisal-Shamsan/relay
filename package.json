@@ -1,0 +1,18 @@
+{
+  "name": "relay",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -b",
+    "build": "tsc -b",
+    "test": "node scripts/ensure-postgres.mjs && tsc -b && node --test --test-concurrency=1 packages/protocol/dist/test/*.test.js packages/sdk/dist/test/*.test.js packages/server/dist/test/*.test.js tests/dist/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "@types/pg": "^8.11.11",
+    "typescript": "^5.8.3"
+  }
+}

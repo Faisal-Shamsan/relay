@@ -1,0 +1,12 @@
+{
+  "name": "@relay/sdk",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/src/index.js"
+  },
+  "dependencies": {
+    "@relay/protocol": "*"
+  }
+}

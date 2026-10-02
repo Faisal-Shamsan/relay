@@ -1,0 +1,290 @@
+import { randomUUID } from "node:crypto";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  canonicalHash,
+  canonicalRelayJson,
+  HTTP_BODY_LIMIT,
+  parseRelayJson,
+  PROTOCOL_VERSION,
+  RelayJsonError,
+  SEEDED_TENANT_ID,
+  type Json,
+} from "@relay/protocol";
+import { callJson, createPool, withTransaction } from "./db.js";
+import { decimalString, fromDatabaseError, HttpError } from "./errors.js";
+
+export interface StartedServer {
+  url: string;
+  close: () => Promise<void>;
+}
+
+export async function startServer(options: {
+  appDatabaseUrl: string;
+  leaseDurationMs: number;
+  port?: number;
+}): Promise<StartedServer> {
+  const pool = createPool(options.appDatabaseUrl);
+  const server = createServer(async (req, res) => {
+    const requestId = randomUUID();
+    try {
+      await route(pool, options.leaseDurationMs, req, res, requestId);
+    } catch (error) {
+      const mapped = error instanceof HttpError ? error : error instanceof RelayJsonError
+        ? new HttpError(422, "Serialization", error.message)
+        : fromDatabaseError(error);
+      if (!mapped) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ code: "Internal", message: "internal error", details: {}, requestId }));
+        return;
+      }
+      sendJson(res, mapped.status, { code: mapped.code, message: mapped.message, details: {}, requestId });
+    }
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(options.port ?? 0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("server did not bind a TCP port");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    close: async () => {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+      await pool.end();
+    },
+  };
+}
+
+async function route(
+  pool: ReturnType<typeof createPool>,
+  leaseDurationMs: number,
+  req: IncomingMessage,
+  res: ServerResponse,
+  requestId: string,
+): Promise<void> {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  if (req.method === "POST" && url.pathname === "/v1/runs") {
+    const body = await readJson(req);
+    const workflowName = requiredString(body, "workflowName");
+    const workflowVersion = requiredString(body, "workflowVersion");
+    if (!("input" in body)) throw new HttpError(422, "Serialization", "input is required");
+    const input = body.input as Json;
+    const triggerHash = canonicalHash([workflowName, workflowVersion, input]);
+    const runId = randomUUID();
+    const result = await callJson(
+      pool,
+      `SELECT relay_create_run($1,$2,$3,$4::jsonb,$5,$6) AS result`,
+      [SEEDED_TENANT_ID, workflowName, workflowVersion, JSON.stringify(input), triggerHash, runId],
+    );
+    sendJson(res, 201, result);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/worker/v1/register") {
+    const body = await readJson(req);
+    requireProtocol(body);
+    const result = await callJson(
+      pool,
+      `SELECT relay_register_worker($1,$2,$3,$4,$5,$6::jsonb) AS result`,
+      [
+        SEEDED_TENANT_ID,
+        requiredString(body, "workerSessionId"),
+        requiredString(body, "operationId"),
+        canonicalHash(body),
+        PROTOCOL_VERSION,
+        JSON.stringify(body.workflows),
+      ],
+    );
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/worker/v1/lease") {
+    const body = await readJson(req);
+    requireProtocol(body);
+    const result = await callJson(
+      pool,
+      `SELECT relay_grant_lease($1,$2,$3,$4::interval) AS result`,
+      [
+        requiredString(body, "workerSessionId"),
+        requiredString(body, "operationId"),
+        canonicalHash(body),
+        `${leaseDurationMs} milliseconds`,
+      ],
+    );
+    sendJson(res, 200, result);
+    return;
+  }
+
+  const history = /^\/worker\/v1\/runs\/([0-9a-fA-F-]{36})\/history$/.exec(url.pathname);
+  if (req.method === "GET" && history) {
+    const runId = history[1];
+    const sessionId = url.searchParams.get("workerSessionId");
+    const after = url.searchParams.get("after") ?? "0";
+    const through = url.searchParams.get("through");
+    if (!sessionId || !through) throw new HttpError(422, "Serialization", "workerSessionId and through are required");
+    decimalString(after, "after");
+    decimalString(through, "through");
+    const rows = await withTransaction(pool, async (client) => {
+      const gate = await client.query(
+        `SELECT s.history_watermark::text AS watermark, q.lease_owner::text AS owner, q.state
+         FROM worker_sessions s
+         JOIN run_queue q ON q.run_id = $2
+         WHERE s.id = $1`,
+        [sessionId, runId],
+      );
+      const row = gate.rows[0] as { watermark: string; owner: string; state: string } | undefined;
+      if (!row || row.state !== "leased" || row.owner !== sessionId || row.watermark !== through) {
+        throw new HttpError(409, "LeaseLost", "history watermark is not the lease snapshot");
+      }
+      const events = await client.query(
+        `SELECT seq::text AS seq, fence::text AS fence, type, step_key AS "stepKey", attempt,
+                command_pos::text AS "commandPos", payload
+         FROM run_events
+         WHERE run_id = $1 AND seq > $2::bigint AND seq <= $3::bigint
+         ORDER BY seq`,
+        [runId, after, through],
+      );
+      return events.rows;
+    });
+    sendJson(res, 200, { events: rows });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/worker/v1/events") {
+    const body = await readJson(req);
+    requireProtocol(body);
+    const intent = body.intent;
+    if (typeof intent !== "object" || intent === null || Array.isArray(intent)) {
+      throw new HttpError(422, "Serialization", "intent is required");
+    }
+    const kind = (intent as { kind?: unknown }).kind;
+    const sessionId = requiredString(body, "workerSessionId");
+    const operationId = requiredString(body, "operationId");
+    const runId = requiredString(body, "runId");
+    const fence = decimalString(body.fence, "fence");
+    const hash = canonicalHash(body);
+    const result = await dispatchIntent(pool, kind, intent as { kind: string; [key: string]: Json }, {
+      sessionId,
+      operationId,
+      runId,
+      fence,
+      hash,
+    });
+    sendJson(res, 200, result);
+    return;
+  }
+
+  sendJson(res, 404, { code: "InvalidRunState", message: "not found", details: {}, requestId });
+}
+
+async function dispatchIntent(
+  pool: ReturnType<typeof createPool>,
+  kind: unknown,
+  intent: { kind: string; [key: string]: Json | undefined },
+  ctx: { sessionId: string; operationId: string; runId: string; fence: string; hash: string },
+): Promise<unknown> {
+  if (kind === "declare_and_start") {
+    const stepKey = requiredString(intent, "stepKey");
+    const expected = decimalString(intent.expectedCommandPos, "expectedCommandPos");
+    return callJson(
+      pool,
+      `SELECT relay_declare_and_start($1,$2,$3,$4::bigint,$5,$6::bigint,$7) AS result`,
+      [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, stepKey, expected, ctx.hash],
+    );
+  }
+  if (kind === "restart_attempt") {
+    return callJson(
+      pool,
+      `SELECT relay_restart_attempt($1,$2,$3,$4::bigint,$5,$6) AS result`,
+      [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, requiredString(intent, "stepKey"), ctx.hash],
+    );
+  }
+  if (kind === "complete_step") {
+    if (typeof intent.attempt !== "number" || !Number.isInteger(intent.attempt)) {
+      throw new HttpError(422, "Serialization", "attempt must be an integer");
+    }
+    if (!Object.hasOwn(intent, "result")) {
+      throw new HttpError(422, "Serialization", "result is required");
+    }
+    return callJson(
+      pool,
+      `SELECT relay_complete_step($1,$2,$3,$4::bigint,$5,$6,$7,$8::jsonb,$9) AS result`,
+      [
+        ctx.operationId,
+        ctx.sessionId,
+        ctx.runId,
+        ctx.fence,
+        requiredString(intent, "stepKey"),
+        intent.attempt,
+        requiredString(intent, "attemptToken"),
+        JSON.stringify(intent.result ?? null),
+        ctx.hash,
+      ],
+    );
+  }
+  if (kind === "finish_run") {
+    return callJson(
+      pool,
+      `SELECT relay_finish_run($1,$2,$3,$4::bigint,$5::jsonb,$6) AS result`,
+      [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, JSON.stringify(intent.output ?? null), ctx.hash],
+    );
+  }
+  throw new HttpError(422, "UnsupportedCapability", "intent is not supported");
+}
+
+function requireProtocol(body: Json): void {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new HttpError(422, "Serialization", "object body is required");
+  }
+  if (body.protocolVersion !== PROTOCOL_VERSION) {
+    throw new HttpError(422, "UnsupportedCapability", "protocol version is not supported");
+  }
+}
+
+function requiredString(body: object, field: string): string {
+  const value = (body as Record<string, unknown>)[field];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new HttpError(422, "Serialization", `${field} is required`);
+  }
+  return value;
+}
+
+async function readJson(req: IncomingMessage): Promise<{ [key: string]: Json }> {
+  const raw = await readBody(req);
+  let parsed: Json;
+  try {
+    parsed = parseRelayJson(raw);
+  } catch (error) {
+    if (error instanceof RelayJsonError) throw new HttpError(422, "Serialization", error.message);
+    throw error;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new HttpError(422, "Serialization", "JSON object is required");
+  }
+  canonicalRelayJson(parsed);
+  return parsed;
+}
+
+async function readBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    size += buffer.length;
+    if (size > HTTP_BODY_LIMIT) {
+      throw new HttpError(413, "Serialization", "request exceeds 4 MiB");
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(body));
+}

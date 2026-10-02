@@ -1,0 +1,10 @@
+{
+  "name": "@relay/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/src/index.js"
+  },
+  "dependencies": {}
+}
