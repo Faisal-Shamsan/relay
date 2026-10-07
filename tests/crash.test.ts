@@ -10,7 +10,7 @@ import { startWorker, waitForFile } from "./spawn.js";
 
 test("crash-process kills the worker after StepStarted and leaves the runner alive", async () => {
   const db = await createTestDatabase();
-  const server = await startServer({ appDatabaseUrl: db.appUrl, leaseDurationMs: 30_000 });
+  const server = await startServer({ appDatabaseUrl: db.appUrl, leaseDurationMs: 30_000, reaperIntervalMs: 0 });
   const admin = new pg.Client({ connectionString: db.adminUrl });
   await admin.connect();
   const dir = mkdtempSync(join(tmpdir(), "relay-crash-"));

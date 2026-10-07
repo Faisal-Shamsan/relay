@@ -7,7 +7,7 @@ import { createTestDatabase, startServer } from "../src/index.js";
 
 test("http completion receipt survives a later fence and a foreign version cannot lease", async () => {
   const db = await createTestDatabase();
-  const server = await startServer({ appDatabaseUrl: db.appUrl, leaseDurationMs: 400 });
+  const server = await startServer({ appDatabaseUrl: db.appUrl, leaseDurationMs: 400, reaperIntervalMs: 0 });
   const admin = new pg.Client({ connectionString: db.adminUrl });
   await admin.connect();
   try {

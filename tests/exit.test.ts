@@ -10,7 +10,7 @@ import { startWorker, waitForFile } from "./spawn.js";
 
 test("M1 exit: crash, expire, second attempt, replay, and duplicate completion receipt", async () => {
   const db = await createTestDatabase();
-  const server = await startServer({ appDatabaseUrl: db.appUrl, leaseDurationMs: 400 });
+  const server = await startServer({ appDatabaseUrl: db.appUrl, leaseDurationMs: 400, reaperIntervalMs: 0 });
   const admin = new pg.Client({ connectionString: db.adminUrl });
   await admin.connect();
   const dir = mkdtempSync(join(tmpdir(), "relay-exit-"));

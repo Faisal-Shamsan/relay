@@ -8,7 +8,7 @@ import { defineWorkflow, runActivation } from "@relay/sdk";
 test("a completed step replays from history without calling the user function again", async () => {
   assert.throws(() => validateRelayJson(new Date()), /Date/);
   const db = await createTestDatabase();
-  const server = await startServer({ appDatabaseUrl: db.appUrl, leaseDurationMs: 30_000 });
+  const server = await startServer({ appDatabaseUrl: db.appUrl, leaseDurationMs: 30_000, reaperIntervalMs: 0 });
   const admin = new pg.Client({ connectionString: db.adminUrl });
   await admin.connect();
   let calls = 0;

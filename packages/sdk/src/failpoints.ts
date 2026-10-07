@@ -24,7 +24,7 @@ export function loadFailpointPlan(plan: { points: FailpointArm[] } | null): Arme
 export async function hitFailpoint(
   points: ArmedPoint[],
   point: string,
-  match: { runId: string; stepKey: string; attempt: number },
+  match: { runId: string; stepKey?: string; attempt?: number },
   barrierDir: string | undefined,
 ): Promise<void> {
   for (const armed of points) {

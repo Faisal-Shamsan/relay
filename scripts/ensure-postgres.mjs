@@ -25,8 +25,16 @@ const started = spawnSync(
   ],
   { encoding: "utf8" },
 );
-if (started.status !== 0 && !String(started.stderr).includes("already in use")) {
-  spawnSync("docker", ["start", "relay-m1-pg"], { stdio: "inherit" });
+if (started.status !== 0) {
+  if (!String(started.stderr).includes("already in use")) {
+    console.error(started.stderr);
+    process.exit(started.status ?? 1);
+  }
+  const existing = spawnSync("docker", ["start", "relay-m1-pg"], { encoding: "utf8" });
+  if (existing.status !== 0) {
+    console.error(existing.stderr);
+    process.exit(existing.status ?? 1);
+  }
 }
 
 const deadline = Date.now() + 60_000;

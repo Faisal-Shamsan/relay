@@ -21,13 +21,18 @@ export interface StartedServer {
 export async function startServer(options: {
   appDatabaseUrl: string;
   leaseDurationMs: number;
+  heartbeatIntervalMs?: number;
+  reaperIntervalMs?: number;
   port?: number;
 }): Promise<StartedServer> {
+  const leaseDurationMs = requirePositiveInteger(options.leaseDurationMs, "leaseDurationMs");
+  const heartbeatIntervalMs = requirePositiveInteger(options.heartbeatIntervalMs ?? 10_000, "heartbeatIntervalMs");
+  const reaperIntervalMs = requireNonNegativeInteger(options.reaperIntervalMs ?? 1_000, "reaperIntervalMs");
   const pool = createPool(options.appDatabaseUrl);
   const server = createServer(async (req, res) => {
     const requestId = randomUUID();
     try {
-      await route(pool, options.leaseDurationMs, req, res, requestId);
+      await route(pool, leaseDurationMs, heartbeatIntervalMs, req, res, requestId);
     } catch (error) {
       const mapped = error instanceof HttpError ? error : error instanceof RelayJsonError
         ? new HttpError(422, "Serialization", error.message)
@@ -48,9 +53,21 @@ export async function startServer(options: {
   if (address === null || typeof address === "string") {
     throw new Error("server did not bind a TCP port");
   }
+  let reaper: NodeJS.Timeout | undefined;
+  if (reaperIntervalMs > 0) {
+    const tick = () => {
+      void reapExpiredLeases(pool, 32).catch((error: unknown) => {
+        console.error("reaper failed", error);
+      });
+    };
+    tick();
+    reaper = setInterval(tick, reaperIntervalMs);
+    reaper.unref();
+  }
   return {
     url: `http://127.0.0.1:${address.port}`,
     close: async () => {
+      if (reaper) clearInterval(reaper);
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
@@ -62,6 +79,7 @@ export async function startServer(options: {
 async function route(
   pool: ReturnType<typeof createPool>,
   leaseDurationMs: number,
+  heartbeatIntervalMs: number,
   req: IncomingMessage,
   res: ServerResponse,
   requestId: string,
@@ -114,6 +132,46 @@ async function route(
         requiredString(body, "operationId"),
         canonicalHash(body),
         `${leaseDurationMs} milliseconds`,
+      ],
+    );
+    if (typeof result !== "object" || result === null || Array.isArray(result)) {
+      throw new HttpError(500, "Internal", "lease response was not an object");
+    }
+    sendJson(res, 200, { ...result, leaseDurationMs, heartbeatIntervalMs });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/worker/v1/heartbeat") {
+    const body = await readJson(req);
+    requireProtocol(body);
+    const result = await callJson(
+      pool,
+      `SELECT relay_heartbeat($1,$2,$3::bigint,$4,$5,$6::interval) AS result`,
+      [
+        requiredString(body, "workerSessionId"),
+        requiredString(body, "runId"),
+        decimalString(body.fence, "fence"),
+        requiredString(body, "operationId"),
+        canonicalHash(body),
+        `${leaseDurationMs} milliseconds`,
+      ],
+    );
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/worker/v1/release") {
+    const body = await readJson(req);
+    requireProtocol(body);
+    const result = await callJson(
+      pool,
+      `SELECT relay_release_lease($1,$2,$3::bigint,$4,$5) AS result`,
+      [
+        requiredString(body, "workerSessionId"),
+        requiredString(body, "runId"),
+        decimalString(body.fence, "fence"),
+        requiredString(body, "operationId"),
+        canonicalHash(body),
       ],
     );
     sendJson(res, 200, result);
@@ -282,6 +340,31 @@ async function readBody(req: IncomingMessage): Promise<string> {
     chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+async function reapExpiredLeases(pool: ReturnType<typeof createPool>, limit: number): Promise<void> {
+  let expired = 0;
+  let tries = 0;
+  while (expired < limit && tries < limit + 100) {
+    tries += 1;
+    const status = await callJson(pool, `SELECT relay_reap_expired_leases(1) AS result`, []);
+    if (status === "none") return;
+    if (status === "expired") expired += 1;
+  }
+}
+
+function requirePositiveInteger(value: number, name: string): number {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function requireNonNegativeInteger(value: number, name: string): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return value;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

@@ -24,6 +24,10 @@ interface StepHistory {
   result?: Json;
 }
 
+export interface HeartbeatSchedule {
+  cancel: () => void;
+}
+
 export async function runActivation(options: {
   serverUrl: string;
   workflow: WorkflowDefinition;
@@ -31,7 +35,9 @@ export async function runActivation(options: {
   failpoints?: { points: FailpointArm[] } | null;
   barrierDir?: string;
   completionRequestPath?: string;
+  heartbeatRequestPath?: string;
   tenantId?: string;
+  schedule?: (delayMs: number, run: () => void) => HeartbeatSchedule;
 }): Promise<Json> {
   const tenantId = options.tenantId ?? SEEDED_TENANT_ID;
   const points = loadFailpointPlan(options.failpoints ?? null);
@@ -54,11 +60,27 @@ export async function runActivation(options: {
   const runId = String(lease.runId);
   const fence = String(lease.fence);
   const watermark = String(lease.historyWatermark);
+  const heartbeatIntervalMs = positiveInterval(lease.heartbeatIntervalMs);
   const history = await getHistory(options.serverUrl, runId, sessionId, watermark);
   const input = inputFromHistory(history);
   const steps = indexSteps(history);
   const seen = new Set<string>();
   let inStep = false;
+  const abort = new AbortController();
+  const control = { lost: false };
+  const beats = startHeartbeats({
+    serverUrl: options.serverUrl,
+    sessionId,
+    runId,
+    fence,
+    intervalMs: heartbeatIntervalMs,
+    schedule: options.schedule ?? defaultSchedule,
+    points,
+    barrierDir: options.barrierDir,
+    heartbeatRequestPath: options.heartbeatRequestPath,
+    abort,
+    control,
+  });
 
   const step = async (name: string, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json> => {
     if (inStep) {
@@ -95,12 +117,12 @@ export async function runActivation(options: {
         ? await postIntent(options, sessionId, runId, fence, {
             kind: "restart_attempt",
             stepKey: name,
-          }, options.completionRequestPath)
+          }, options.completionRequestPath, control)
         : await postIntent(options, sessionId, runId, fence, {
             kind: "declare_and_start",
             stepKey: name,
             expectedCommandPos: "0",
-          }, options.completionRequestPath);
+          }, options.completionRequestPath, control);
       const attempt = Number(started.attempt);
       const attemptToken = String(started.attemptToken);
       const idempotencyKey = logicalStepIdempotencyKey(tenantId, runId, name);
@@ -109,7 +131,7 @@ export async function runActivation(options: {
         idempotencyKey,
         attempt,
         attemptToken,
-        signal: new AbortController().signal,
+        signal: abort.signal,
       });
       const result = validateRelayJson(raw);
       await hitFailpoint(
@@ -125,6 +147,7 @@ export async function runActivation(options: {
         fence,
         { kind: "complete_step", stepKey: name, attempt, attemptToken, result },
         options.completionRequestPath,
+        control,
       );
       await hitFailpoint(
         points,
@@ -138,19 +161,101 @@ export async function runActivation(options: {
     }
   };
 
-  const output = await options.workflow.fn({ step }, input);
-  const canonicalOutput = validateRelayJson(output);
-  if (options.finishRun !== false) {
-    await postIntent(
-      options,
-      sessionId,
-      runId,
-      fence,
-      { kind: "finish_run", output: canonicalOutput },
-      options.completionRequestPath,
-    );
+  try {
+    const output = await options.workflow.fn({ step }, input);
+    beats.stop();
+    if (control.lost) throw new Error("lease lost");
+    const canonicalOutput = validateRelayJson(output);
+    if (options.finishRun !== false) {
+      await postIntent(
+        options,
+        sessionId,
+        runId,
+        fence,
+        { kind: "finish_run", output: canonicalOutput },
+        options.completionRequestPath,
+        control,
+      );
+    }
+    return canonicalOutput;
+  } finally {
+    beats.stop();
   }
-  return canonicalOutput;
+}
+
+function startHeartbeats(options: {
+  serverUrl: string;
+  sessionId: string;
+  runId: string;
+  fence: string;
+  intervalMs: number;
+  schedule: (delayMs: number, run: () => void) => HeartbeatSchedule;
+  points: ReturnType<typeof loadFailpointPlan>;
+  barrierDir: string | undefined;
+  heartbeatRequestPath: string | undefined;
+  abort: AbortController;
+  control: { lost: boolean };
+}): { stop: () => void } {
+  let stopped = false;
+  let current: HeartbeatSchedule | undefined;
+  const tick = () => {
+    if (stopped) return;
+    void (async () => {
+      try {
+        const body = {
+          protocolVersion: PROTOCOL_VERSION,
+          operationId: randomUUID(),
+          workerSessionId: options.sessionId,
+          runId: options.runId,
+          fence: options.fence,
+        };
+        if (options.heartbeatRequestPath) writeFileSync(options.heartbeatRequestPath, JSON.stringify(body));
+        await postJson(`${options.serverUrl}/worker/v1/heartbeat`, body);
+        if (stopped) return;
+        await hitFailpoint(options.points, "heartbeat.after-commit-before-response", { runId: options.runId }, options.barrierDir);
+        if (stopped) return;
+        current = options.schedule(options.intervalMs, tick);
+      } catch (error) {
+        if (stopped) return;
+        if (error instanceof WorkerHttpError && error.status === 409) {
+          stopped = true;
+          options.control.lost = true;
+          options.abort.abort();
+          return;
+        }
+        current = options.schedule(options.intervalMs, tick);
+      }
+    })();
+  };
+  current = options.schedule(options.intervalMs, tick);
+  return {
+    stop() {
+      stopped = true;
+      current?.cancel();
+    },
+  };
+}
+
+function defaultSchedule(delayMs: number, run: () => void): HeartbeatSchedule {
+  const timer = setTimeout(run, delayMs);
+  return { cancel: () => clearTimeout(timer) };
+}
+
+function positiveInterval(value: Json | undefined): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new Error("heartbeatIntervalMs must be a positive integer");
+  }
+  return value;
+}
+
+class WorkerHttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "WorkerHttpError";
+  }
 }
 
 async function postIntent(
@@ -160,7 +265,9 @@ async function postIntent(
   fence: string,
   intent: Json,
   completionRequestPath: string | undefined,
+  control: { lost: boolean },
 ): Promise<{ [key: string]: Json }> {
+  if (control.lost) throw new Error("lease lost");
   const body = {
     protocolVersion: PROTOCOL_VERSION,
     operationId: randomUUID(),
@@ -188,7 +295,7 @@ async function postJson(url: string, body: Json): Promise<{ [key: string]: Json 
   const text = await response.text();
   const parsed = text.length === 0 ? null : JSON.parse(text) as Json;
   if (!response.ok) {
-    throw new Error(`POST ${url} failed ${response.status}: ${text}`);
+    throw new WorkerHttpError(response.status, `POST ${url} failed ${response.status}: ${text}`);
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error("expected object response");
