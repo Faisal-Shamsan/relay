@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 1, milestone M3 complete. Phase 1 is not complete.
+Phase 1, milestone M4 complete. Phase 1 is not complete.
 
 ## Completed
 
@@ -12,6 +12,7 @@ Phase 1, milestone M3 complete. Phase 1 is not complete.
 - M1: one sequential step. A crash before completion restarts the attempt. A later attempt completes. Replay returns the stored result without calling the user function. A duplicate completion returns the stored receipt.
 - M2: heartbeat, explicit release, and a reaper. A stale owner cannot renew or write after expiry or a newer grant. Client clocks do not choose deadlines.
 - M3: a crash after an external effect and before completion runs the callback again with the same provider key. Finish-run crashes before commit roll back together. A changed body with the same operation id conflicts.
+- M4: duplicate step keys fail before the second callback. Reordered, removed, and inserted commands diverge before the new callback. A captured value with the same command shape is not detected.
 
 ## In progress
 
@@ -25,6 +26,8 @@ Heartbeat renewal, explicit release, and a server reaper that expires one due le
 
 A fake provider in the test worker records invocations and effects. F05 is `tests/effects.test.ts`. Finish-run failpoints abort the transaction in `packages/server/sql/003_m3.sql`; F16 is `packages/server/test/atomicity.test.ts`. F18 is `packages/server/test/idempotency.test.ts`.
 
+Structural replay compares the command at each position before calling the user function. F10, F11, and F12 are in `tests/structure.test.ts`.
+
 ## Known issues
 
 - F02 stream writes are not implemented. They belong to Phase 2.
@@ -33,8 +36,8 @@ A fake provider in the test worker records invocations and effects. F05 is `test
 
 ## Next milestone
 
-M4: structural replay.
+M5: bounded parallel steps.
 
 ## Next task
 
-Duplicate step keys, structural divergence, and the case structural replay does not detect (F10, F11, F12).
+Memoized and recovered parallel children, and deterministic completion order (F08, F09).

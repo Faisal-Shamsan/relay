@@ -1,6 +1,6 @@
 # Test matrix
 
-Starter matrix from [spec.md](spec.md) §12.2. Every row is a required failure scenario. F01 and F06 are covered by the M1 exit test. F03, F04, F07, and F20 are covered by the M2 fencing tests. F02 is covered except stream writes, which stay Phase 2. F05, F16, and F18 are covered by the M3 proofs. Every other row is still not implemented.
+Starter matrix from [spec.md](spec.md) §12.2. Every row is a required failure scenario. F01 and F06 are covered by the M1 exit test. F03, F04, F07, and F20 are covered by the M2 fencing tests. F02 is covered except stream writes, which stay Phase 2. F05, F16, and F18 are covered by the M3 proofs. F10, F11, and F12 are covered by the M4 structural replay tests. Every other row is still not implemented.
 
 Invariant IDs refer to [invariants.md](invariants.md). Where no ledger ID is the primary claim, the invariant cell is `—`.
 
@@ -15,9 +15,9 @@ Invariant IDs refer to [invariants.md](invariants.md). Where no ledger ID is the
 | F07 (Phase 1): Concurrent lease attempts by two workers for one run | At most one current ownership grant. Fences increase monotonically. | INV-002 | packages/server/test/fencing.test.ts | Implemented |
 | F08 (Phase 1): Parallel child A completes, B is active, C fails, then the worker crashes | A is memoized. B is recovered. In Phase 1, C is replayed as exhausted. Group error order is deterministic. | INV-001, INV-011 | — | Not implemented |
 | F09 (Phase 1): Parallel children finish simultaneously in reversed orders | Event sequences are unique and ordered. Discovery ordinals and returned result order stay identical. | INV-010, INV-011 | — | Not implemented |
-| F10 (Phase 1): Duplicate step key, child or sequential | Error before the duplicate callback. No partial group declaration. | — | — | Not implemented |
-| F11 (Phase 1): Replay divergence from inserted, removed, or reordered historical commands, or an early return | Precise divergence report. No mismatched memoized hit and no new callback. | INV-006 | — | Not implemented |
-| F12 (Phase 1): Captured value changes while the command shape stays identical | The test documents that structural detection does not detect this case. | INV-015 | — | Not implemented |
+| F10 (Phase 1): Duplicate step key, child or sequential | Error before the duplicate callback. No partial group declaration. | — | tests/structure.test.ts | Implemented |
+| F11 (Phase 1): Replay divergence from inserted, removed, or reordered historical commands, or an early return | Precise divergence report. No mismatched memoized hit and no new callback. | INV-006 | tests/structure.test.ts | Implemented |
+| F12 (Phase 1): Captured value changes while the command shape stays identical | The test documents that structural detection does not detect this case. | INV-015 | tests/structure.test.ts | Implemented |
 | F13 (Phase 2): Same captured-input change with an explicit input fingerprint | Divergence is reported before a memoized result is returned. | INV-006 | — | Not implemented |
 | F14 (Phase 2): Helper keys reordered, or a helper response is lost | Mismatch is detected. An identical retry or replay returns the original committed value. | INV-006, INV-011 | — | Not implemented |
 | F15 (Phase 1): Invalid JSON values, including undefined, Date, BigInt, cycles, and unsafe integers | Rejected with path and context. No silently transformed success record. | INV-013 | — | Not implemented |

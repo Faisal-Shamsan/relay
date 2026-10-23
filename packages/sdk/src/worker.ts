@@ -15,6 +15,7 @@ interface HistoryEvent {
   type: string;
   stepKey: string | null;
   attempt: number | null;
+  commandPos: string | null;
   payload: { descriptor?: Json; result?: Json; [key: string]: Json | undefined };
 }
 
@@ -63,8 +64,9 @@ export async function runActivation(options: {
   const heartbeatIntervalMs = positiveInterval(lease.heartbeatIntervalMs);
   const history = await getHistory(options.serverUrl, runId, sessionId, watermark);
   const input = inputFromHistory(history);
-  const steps = indexSteps(history);
+  const commands = indexCommands(history);
   const seen = new Set<string>();
+  let nextPos = 0;
   let inStep = false;
   const abort = new AbortController();
   const control = { lost: false };
@@ -93,27 +95,30 @@ export async function runActivation(options: {
       error.name = "DuplicateStepKey";
       throw error;
     }
-    seen.add(name);
-    const expected = { kind: "step", key: name, explicitInput: false };
-    const existing = steps.get(name);
-    if (existing) {
+    const position = nextPos;
+    const expected = { kind: "step" as const, key: name, explicitInput: false };
+    const historical = commands[position];
+    if (historical) {
       if (
-        existing.descriptor.kind !== expected.kind ||
-        existing.descriptor.key !== expected.key ||
-        existing.descriptor.explicitInput !== expected.explicitInput
+        historical.descriptor.kind !== expected.kind ||
+        historical.descriptor.key !== expected.key ||
+        historical.descriptor.explicitInput !== expected.explicitInput
       ) {
-        const error = new Error("command descriptor mismatch");
-        error.name = "Nondeterminism";
-        throw error;
+        throw nondeterminism(position, historical.descriptor, expected);
       }
-      if (existing.completed) {
-        return validateRelayJson(existing.result ?? null);
+      seen.add(name);
+      nextPos += 1;
+      if (historical.completed) {
+        return validateRelayJson(historical.result ?? null);
       }
+    } else {
+      seen.add(name);
+      nextPos += 1;
     }
 
     inStep = true;
     try {
-      const started = existing
+      const started = historical
         ? await postIntent(options, sessionId, runId, fence, {
             kind: "restart_attempt",
             stepKey: name,
@@ -121,7 +126,7 @@ export async function runActivation(options: {
         : await postIntent(options, sessionId, runId, fence, {
             kind: "declare_and_start",
             stepKey: name,
-            expectedCommandPos: "0",
+            expectedCommandPos: String(position),
           }, options.completionRequestPath, control);
       const attempt = Number(started.attempt);
       const attemptToken = String(started.attemptToken);
@@ -165,6 +170,10 @@ export async function runActivation(options: {
     const output = await options.workflow.fn({ step }, input);
     beats.stop();
     if (control.lost) throw new Error("lease lost");
+    if (nextPos < commands.length) {
+      const pending = commands[nextPos];
+      throw nondeterminism(nextPos, pending?.descriptor ?? null, null, "unconsumed history");
+    }
     const canonicalOutput = validateRelayJson(output);
     if (options.finishRun !== false) {
       await postIntent(
@@ -320,21 +329,28 @@ function inputFromHistory(events: HistoryEvent[]): Json {
   return validateRelayJson(created.payload.input ?? null);
 }
 
-function indexSteps(events: HistoryEvent[]): Map<string, StepHistory> {
-  const steps = new Map<string, StepHistory>();
+function indexCommands(events: HistoryEvent[]): StepHistory[] {
+  const commands: StepHistory[] = [];
   for (const event of events) {
     if (event.type === "CommandRecorded" && event.payload.descriptor && typeof event.payload.descriptor === "object") {
       const descriptor = event.payload.descriptor as StepHistory["descriptor"];
-      if (typeof descriptor.key === "string") {
-        steps.set(descriptor.key, { descriptor, completed: false });
-      }
+      const position = Number(event.commandPos ?? commands.length);
+      commands[position] = { descriptor, completed: false };
     }
     if (event.type === "StepCompleted" && event.stepKey) {
-      const current = steps.get(event.stepKey) ?? { descriptor: {}, completed: false };
-      current.completed = true;
-      current.result = event.payload.result;
-      steps.set(event.stepKey, current);
+      const command = commands.find((item) => item?.descriptor.key === event.stepKey);
+      if (command) {
+        command.completed = true;
+        command.result = event.payload.result;
+      }
     }
   }
-  return steps;
+  return commands;
+}
+
+function nondeterminism(position: number, expected: Json, actual: Json | null, reason = "command descriptor mismatch"): Error {
+  const error = new Error(reason) as Error & { details: Json };
+  error.name = "Nondeterminism";
+  error.details = { position: String(position), expected, actual, reason };
+  return error;
 }
