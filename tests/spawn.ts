@@ -5,11 +5,11 @@ import { fileURLToPath } from "node:url";
 
 export const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
-export function startWorker(env: NodeJS.ProcessEnv): {
+export function startWorker(env: NodeJS.ProcessEnv, entry = "packages/sdk/dist/src/test-worker.js"): {
   child: ChildProcess;
   done: Promise<{ code: number; stderr: string }>;
 } {
-  const child = spawn(process.execPath, [join(repoRoot, "packages/sdk/dist/src/test-worker.js")], {
+  const child = spawn(process.execPath, [join(repoRoot, entry)], {
     cwd: repoRoot,
     env: { ...process.env, ...env },
   });

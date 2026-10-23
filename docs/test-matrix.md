@@ -1,6 +1,6 @@
 # Test matrix
 
-Starter matrix from [spec.md](spec.md) §12.2. Every row is a required failure scenario. F01 and F06 are covered by the M1 exit test. F03, F04, F07, and F20 are covered by the M2 fencing tests. F02 is covered except stream writes, which stay Phase 2. F05, F16, and F18 are covered by the M3 proofs. F10, F11, and F12 are covered by the M4 structural replay tests. Every other row is still not implemented.
+Starter matrix from [spec.md](spec.md) §12.2. Every row is a required failure scenario. F01 and F06 are covered by the M1 exit test. F03, F04, F07, and F20 are covered by the M2 fencing tests. F02 is covered except stream writes, which stay Phase 2. F05, F16, and F18 are covered by the M3 proofs. F10, F11, and F12 are covered by the M4 structural replay tests. F08 and F09 are covered by the M5 parallel tests. F17, F19, and F21 are covered by the M6 admission tests. Every other row is still not implemented.
 
 Invariant IDs refer to [invariants.md](invariants.md). Where no ledger ID is the primary claim, the invariant cell is `—`.
 
@@ -13,8 +13,8 @@ Invariant IDs refer to [invariants.md](invariants.md). Where no ledger ID is the
 | F05 (Phase 1): Crash after an external side effect but before the completion commit | The callback may run twice. The stable provider key is unchanged. Deduplication occurs only when the fake provider supports it. | INV-012 | tests/effects.test.ts | Implemented |
 | F06 (Phase 1): Completion commits, then the HTTP response is dropped | Retry returns the receipt. There is one completion and no callback restart. | INV-001 | tests/exit.test.ts | Implemented |
 | F07 (Phase 1): Concurrent lease attempts by two workers for one run | At most one current ownership grant. Fences increase monotonically. | INV-002 | packages/server/test/fencing.test.ts | Implemented |
-| F08 (Phase 1): Parallel child A completes, B is active, C fails, then the worker crashes | A is memoized. B is recovered. In Phase 1, C is replayed as exhausted. Group error order is deterministic. | INV-001, INV-011 | — | Not implemented |
-| F09 (Phase 1): Parallel children finish simultaneously in reversed orders | Event sequences are unique and ordered. Discovery ordinals and returned result order stay identical. | INV-010, INV-011 | — | Not implemented |
+| F08 (Phase 1): Parallel child A completes, B is active, C fails, then the worker crashes | A is memoized. B is recovered. In Phase 1, C is replayed as exhausted. Group error order is deterministic. | INV-001, INV-011 | tests/parallel.test.ts | Implemented |
+| F09 (Phase 1): Parallel children finish simultaneously in reversed orders | Event sequences are unique and ordered. Discovery ordinals and returned result order stay identical. | INV-010, INV-011 | tests/parallel.test.ts | Implemented |
 | F10 (Phase 1): Duplicate step key, child or sequential | Error before the duplicate callback. No partial group declaration. | — | tests/structure.test.ts | Implemented |
 | F11 (Phase 1): Replay divergence from inserted, removed, or reordered historical commands, or an early return | Precise divergence report. No mismatched memoized hit and no new callback. | INV-006 | tests/structure.test.ts | Implemented |
 | F12 (Phase 1): Captured value changes while the command shape stays identical | The test documents that structural detection does not detect this case. | INV-015 | tests/structure.test.ts | Implemented |
@@ -22,11 +22,11 @@ Invariant IDs refer to [invariants.md](invariants.md). Where no ledger ID is the
 | F14 (Phase 2): Helper keys reordered, or a helper response is lost | Mismatch is detected. An identical retry or replay returns the original committed value. | INV-006, INV-011 | — | Not implemented |
 | F15 (Phase 1): Invalid JSON values, including undefined, Date, BigInt, cycles, and unsafe integers | Rejected with path and context. No silently transformed success record. | INV-013 | — | Not implemented |
 | F16 (Phase 1): Crash after event insert, projection update, or queue update, but before commit | All changes roll back together. No stranded event, projection, or queue state. | INV-005, INV-010 | packages/server/test/atomicity.test.ts | Implemented |
-| F17 (Phase 1): Concurrent identical triggers, and conflicting reuse of an idempotency key | One run for identical intent. 409 for conflicting intent. | — | — | Not implemented |
+| F17 (Phase 1): Concurrent identical triggers, and conflicting reuse of an idempotency key | One run for identical intent. 409 for conflicting intent. | — | packages/server/test/admission.test.ts | Implemented |
 | F18 (Phase 1): Changed body with the same operation ID | Conflict. Original history and receipt are preserved. | INV-005 | packages/server/test/idempotency.test.ts | Implemented |
-| F19 (Phase 1): Incompatible workflow version. Deploy v2 while v1 runs exist and remove the v1 worker | Routing stays on the pinned version. v1 waits visibly and does not run on v2. | INV-003 | — | Not implemented |
+| F19 (Phase 1): Incompatible workflow version. Deploy v2 while v1 runs exist and remove the v1 worker | Routing stays on the pinned version. v1 waits visibly and does not run on v2. | INV-003 | packages/server/test/admission.test.ts | Implemented |
 | F20 (Phase 1): Worker clocks intentionally skewed | Lease, grant, and expiry decisions depend only on Postgres time. | INV-007 | packages/server/test/fencing.test.ts, tests/heartbeat.test.ts | Implemented |
-| F21 (Phase 1): Direct invalid state, tenant foreign key, or unauthorized DML | Constraint or privilege rejection. No persisted invalid row. | — | — | Not implemented |
+| F21 (Phase 1): Direct invalid state, tenant foreign key, or unauthorized DML | Constraint or privilege rejection. No persisted invalid row. | — | packages/server/test/admission.test.ts | Implemented |
 | F22 (Phase 1): Database disconnect or failover around commit | Unknown outcome is resolved from receipts and history. No assumption of rollback. Failover RPO is disclosed. | INV-004 | — | Not implemented |
 | F23 (Phase 2): Duplicate stream-batch retry. Commit a batch, drop the response, and retry | One batch row, the same stream sequence, and an unchanged last-batch counter. | INV-008, INV-010 | — | Not implemented |
 | F24 (Phase 2): Reuse a batch ID with different text, or send a gap | Conflict or gap is rejected. No partial update. | INV-008 | — | Not implemented |

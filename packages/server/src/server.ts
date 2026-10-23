@@ -23,16 +23,18 @@ export async function startServer(options: {
   leaseDurationMs: number;
   heartbeatIntervalMs?: number;
   reaperIntervalMs?: number;
+  recoveryBudget?: number;
   port?: number;
 }): Promise<StartedServer> {
   const leaseDurationMs = requirePositiveInteger(options.leaseDurationMs, "leaseDurationMs");
   const heartbeatIntervalMs = requirePositiveInteger(options.heartbeatIntervalMs ?? 10_000, "heartbeatIntervalMs");
   const reaperIntervalMs = requireNonNegativeInteger(options.reaperIntervalMs ?? 1_000, "reaperIntervalMs");
+  const recoveryBudget = requireRecoveryBudget(options.recoveryBudget ?? 100);
   const pool = createPool(options.appDatabaseUrl);
   const server = createServer(async (req, res) => {
     const requestId = randomUUID();
     try {
-      await route(pool, leaseDurationMs, heartbeatIntervalMs, req, res, requestId);
+      await route(pool, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId);
     } catch (error) {
       const mapped = error instanceof HttpError ? error : error instanceof RelayJsonError
         ? new HttpError(422, "Serialization", error.message)
@@ -80,6 +82,7 @@ async function route(
   pool: ReturnType<typeof createPool>,
   leaseDurationMs: number,
   heartbeatIntervalMs: number,
+  recoveryBudget: number,
   req: IncomingMessage,
   res: ServerResponse,
   requestId: string,
@@ -91,14 +94,44 @@ async function route(
     const workflowVersion = requiredString(body, "workflowVersion");
     if (!("input" in body)) throw new HttpError(422, "Serialization", "input is required");
     const input = body.input as Json;
+    const idempotencyKey = idempotencyHeader(req);
     const triggerHash = canonicalHash([workflowName, workflowVersion, input]);
     const runId = randomUUID();
     const result = await callJson(
       pool,
-      `SELECT relay_create_run($1,$2,$3,$4::jsonb,$5,$6) AS result`,
-      [SEEDED_TENANT_ID, workflowName, workflowVersion, JSON.stringify(input), triggerHash, runId],
+      `SELECT relay_create_run($1,$2,$3,$4::jsonb,$5,$6,$7) AS result`,
+      [SEEDED_TENANT_ID, workflowName, workflowVersion, JSON.stringify(input), triggerHash, runId, idempotencyKey],
     );
-    sendJson(res, 201, result);
+    const created = result as { runId?: unknown; created?: unknown } | null;
+    if (typeof created !== "object" || created === null || Array.isArray(created) || typeof created.runId !== "string") {
+      throw new Error("create response was not an object");
+    }
+    sendJson(res, created.created === false ? 200 : 201, { runId: created.runId });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/workflows") {
+    const rows = await withTransaction(pool, async (client) => {
+      const listed = await client.query(
+        `SELECT wv.name,
+                wv.version,
+                (SELECT count(*)::int
+                 FROM worker_session_versions m
+                 JOIN worker_sessions s ON s.id = m.worker_session_id
+                 WHERE m.workflow_version_id = wv.id
+                   AND s.expires_at > clock_timestamp()) AS "compatibleWorkers",
+                (SELECT count(*)::int
+                 FROM runs r
+                 WHERE r.workflow_version_id = wv.id
+                   AND r.state = 'pending') AS "pendingRuns"
+         FROM workflow_versions wv
+         WHERE wv.tenant_id = $1
+         ORDER BY wv.name, wv.version`,
+        [SEEDED_TENANT_ID],
+      );
+      return listed.rows;
+    });
+    sendJson(res, 200, { workflows: rows });
     return;
   }
 
@@ -232,6 +265,7 @@ async function route(
       runId,
       fence,
       hash,
+      recoveryBudget,
     });
     sendJson(res, 200, result);
     return;
@@ -244,23 +278,66 @@ async function dispatchIntent(
   pool: ReturnType<typeof createPool>,
   kind: unknown,
   intent: { kind: string; [key: string]: Json | undefined },
-  ctx: { sessionId: string; operationId: string; runId: string; fence: string; hash: string },
+  ctx: { sessionId: string; operationId: string; runId: string; fence: string; hash: string; recoveryBudget: number },
 ): Promise<unknown> {
   if (kind === "declare_and_start") {
     const stepKey = requiredString(intent, "stepKey");
     const expected = decimalString(intent.expectedCommandPos, "expectedCommandPos");
     return callJson(
       pool,
-      `SELECT relay_declare_and_start($1,$2,$3,$4::bigint,$5,$6::bigint,$7) AS result`,
-      [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, stepKey, expected, ctx.hash],
+      `WITH cfg AS (SELECT set_config('relay.recovery_budget', $8, true))
+       SELECT relay_declare_and_start($1,$2,$3,$4::bigint,$5,$6::bigint,$7) AS result FROM cfg`,
+      [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, stepKey, expected, ctx.hash, String(ctx.recoveryBudget)],
+    );
+  }
+  if (kind === "declare_parallel") {
+    const children = intent.children;
+    if (!Array.isArray(children) || children.some((child) => typeof child !== "string")) {
+      throw new HttpError(422, "Serialization", "children must be an array of strings");
+    }
+    if (typeof intent.concurrency !== "number" || !Number.isInteger(intent.concurrency)) {
+      throw new HttpError(422, "Serialization", "concurrency must be an integer");
+    }
+    return callJson(
+      pool,
+      `WITH cfg AS (SELECT set_config('relay.recovery_budget', $10, true))
+       SELECT relay_declare_parallel($1,$2,$3,$4::bigint,$5,$6::bigint,$7::jsonb,$8,$9) AS result FROM cfg`,
+      [
+        ctx.operationId,
+        ctx.sessionId,
+        ctx.runId,
+        ctx.fence,
+        requiredString(intent, "groupKey"),
+        decimalString(intent.expectedCommandPos, "expectedCommandPos"),
+        JSON.stringify(children),
+        intent.concurrency,
+        ctx.hash,
+        String(ctx.recoveryBudget),
+      ],
+    );
+  }
+  if (kind === "start_attempt") {
+    return callJson(
+      pool,
+      `SELECT relay_start_attempt($1,$2,$3,$4::bigint,$5,$6) AS result`,
+      [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, requiredString(intent, "stepKey"), ctx.hash],
     );
   }
   if (kind === "restart_attempt") {
-    return callJson(
+    const restarted = await callJson(
       pool,
       `SELECT relay_restart_attempt($1,$2,$3,$4::bigint,$5,$6) AS result`,
       [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, requiredString(intent, "stepKey"), ctx.hash],
     );
+    if (
+      typeof restarted === "object"
+      && restarted !== null
+      && !Array.isArray(restarted)
+      && (restarted as { code?: unknown }).code === "RecoveryBudgetExceeded"
+    ) {
+      throw new HttpError(409, "RecoveryBudgetExceeded", "recovery budget is exhausted");
+    }
+    return restarted;
   }
   if (kind === "complete_step") {
     if (typeof intent.attempt !== "number" || !Number.isInteger(intent.attempt)) {
@@ -281,6 +358,29 @@ async function dispatchIntent(
         intent.attempt,
         requiredString(intent, "attemptToken"),
         JSON.stringify(intent.result ?? null),
+        ctx.hash,
+      ],
+    );
+  }
+  if (kind === "fail_step") {
+    if (typeof intent.attempt !== "number" || !Number.isInteger(intent.attempt)) {
+      throw new HttpError(422, "Serialization", "attempt must be an integer");
+    }
+    if (typeof intent.error !== "object" || intent.error === null || Array.isArray(intent.error)) {
+      throw new HttpError(422, "Serialization", "error is required");
+    }
+    return callJson(
+      pool,
+      `SELECT relay_fail_step($1,$2,$3,$4::bigint,$5,$6,$7,$8::jsonb,$9) AS result`,
+      [
+        ctx.operationId,
+        ctx.sessionId,
+        ctx.runId,
+        ctx.fence,
+        requiredString(intent, "stepKey"),
+        intent.attempt,
+        requiredString(intent, "attemptToken"),
+        JSON.stringify(intent.error),
         ctx.hash,
       ],
     );
@@ -358,6 +458,22 @@ function requirePositiveInteger(value: number, name: string): number {
     throw new Error(`${name} must be a positive integer`);
   }
   return value;
+}
+
+function requireRecoveryBudget(value: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > 2147483647) {
+    throw new Error("recoveryBudget must be a positive integer");
+  }
+  return value;
+}
+
+function idempotencyHeader(req: IncomingMessage): string | null {
+  const header = req.headers["idempotency-key"];
+  if (header === undefined) return null;
+  if (typeof header !== "string" || Buffer.byteLength(header) < 1 || Buffer.byteLength(header) > 256) {
+    throw new HttpError(422, "Serialization", "Idempotency-Key length is invalid");
+  }
+  return header;
 }
 
 function requireNonNegativeInteger(value: number, name: string): number {

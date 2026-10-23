@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 1, milestone M4 complete. Phase 1 is not complete.
+Phase 1, milestone M6 complete. Phase 1 is not complete.
 
 ## Completed
 
@@ -13,6 +13,8 @@ Phase 1, milestone M4 complete. Phase 1 is not complete.
 - M2: heartbeat, explicit release, and a reaper. A stale owner cannot renew or write after expiry or a newer grant. Client clocks do not choose deadlines.
 - M3: a crash after an external effect and before completion runs the callback again with the same provider key. Finish-run crashes before commit roll back together. A changed body with the same operation id conflicts.
 - M4: duplicate step keys fail before the second callback. Reordered, removed, and inserted commands diverge before the new callback. A captured value with the same command shape is not detected.
+- M5: a parallel group declares every child in one transaction. A completed child is memoized, an active child restarts, and a failed child stays exhausted. Reversed completion order does not change discovery ordinals or the returned result order.
+- M6: an identical trigger returns the same run, and a different intent conflicts. A pinned v1 run stays pending when only a v2 worker is live. Direct invalid writes do not persist. Exceeding the stored recovery budget fails the run instead of starting another attempt.
 
 ## In progress
 
@@ -28,6 +30,10 @@ A fake provider in the test worker records invocations and effects. F05 is `test
 
 Structural replay compares the command at each position before calling the user function. F10, F11, and F12 are in `tests/structure.test.ts`.
 
+`ctx.step.parallel` records the group and its children before any callback. Each child start, completion, and failure commits independently. F08 and F09 are in `tests/parallel.test.ts`. Phase 1 does not retry an exhausted child.
+
+Trigger identity is the tenant plus the idempotency key. F17 is `packages/server/test/admission.test.ts`. `GET /v1/workflows` reports live compatible workers. F19 is in the same file. F21 rejects invalid state, a missing tenant, and direct application writes. A step stores its recovery ceiling at declaration. Exhaustion is `tests/recovery.test.ts`. The default ceiling is 100.
+
 ## Known issues
 
 - F02 stream writes are not implemented. They belong to Phase 2.
@@ -36,8 +42,8 @@ Structural replay compares the command at each position before calling the user 
 
 ## Next milestone
 
-M5: bounded parallel steps.
+M7: Phase 1 gate.
 
 ## Next task
 
-Memoized and recovered parallel children, and deterministic completion order (F08, F09).
+Remaining failpoint hooks, projection verification, Phase 1 read APIs, the failover disclosure, the failure demo, and a runnable README.

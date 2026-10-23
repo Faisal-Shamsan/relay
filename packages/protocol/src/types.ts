@@ -10,6 +10,17 @@ export type WorkerIntent =
       expectedCommandPos: string;
     }
   | {
+      kind: "declare_parallel";
+      groupKey: string;
+      expectedCommandPos: string;
+      children: string[];
+      concurrency: number;
+    }
+  | {
+      kind: "start_attempt";
+      stepKey: string;
+    }
+  | {
       kind: "restart_attempt";
       stepKey: string;
     }
@@ -19,6 +30,13 @@ export type WorkerIntent =
       attempt: number;
       attemptToken: string;
       result: Json;
+    }
+  | {
+      kind: "fail_step";
+      stepKey: string;
+      attempt: number;
+      attemptToken: string;
+      error: { code: "StepFailed"; message: string };
     }
   | {
       kind: "finish_run";
