@@ -8,7 +8,13 @@ import {
   type Json,
 } from "@relay/protocol";
 import { hitFailpoint, loadFailpointPlan, type FailpointArm } from "./failpoints.js";
-import type { StepContext, WorkflowDefinition } from "./workflow.js";
+import {
+  ParallelStepError,
+  type ParallelChild,
+  type ParallelFailure,
+  type StepContext,
+  type WorkflowDefinition,
+} from "./workflow.js";
 
 interface HistoryEvent {
   seq: string;
@@ -16,13 +22,19 @@ interface HistoryEvent {
   stepKey: string | null;
   attempt: number | null;
   commandPos: string | null;
-  payload: { descriptor?: Json; result?: Json; [key: string]: Json | undefined };
+  payload: { descriptor?: Json; result?: Json; error?: Json; [key: string]: Json | undefined };
 }
 
-interface StepHistory {
-  descriptor: { kind?: Json; key?: Json; explicitInput?: Json };
+interface CommandHistory {
+  descriptor: { [key: string]: Json };
   completed: boolean;
   result?: Json;
+}
+
+interface ChildHistory {
+  terminal: "open" | "completed" | "failed";
+  result?: Json;
+  error?: Json;
 }
 
 export interface HeartbeatSchedule {
@@ -65,9 +77,12 @@ export async function runActivation(options: {
   const history = await getHistory(options.serverUrl, runId, sessionId, watermark);
   const input = inputFromHistory(history);
   const commands = indexCommands(history);
+  const childStates = indexChildren(history);
   const seen = new Set<string>();
+  const seenGroups = new Set<string>();
   let nextPos = 0;
   let inStep = false;
+  let inCallback = 0;
   const abort = new AbortController();
   const control = { lost: false };
   const beats = startHeartbeats({
@@ -85,7 +100,7 @@ export async function runActivation(options: {
   });
 
   const step = async (name: string, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json> => {
-    if (inStep) {
+    if (inStep || inCallback > 0) {
       const error = new Error("nested step");
       error.name = "ConcurrentCommand";
       throw error;
@@ -132,12 +147,18 @@ export async function runActivation(options: {
       const attemptToken = String(started.attemptToken);
       const idempotencyKey = logicalStepIdempotencyKey(tenantId, runId, name);
       await hitFailpoint(points, "step.after-start-commit-before-callback", { runId, stepKey: name, attempt }, options.barrierDir);
-      const raw = await fn({
-        idempotencyKey,
-        attempt,
-        attemptToken,
-        signal: abort.signal,
-      });
+      inCallback += 1;
+      let raw: Json;
+      try {
+        raw = await fn({
+          idempotencyKey,
+          attempt,
+          attemptToken,
+          signal: abort.signal,
+        });
+      } finally {
+        inCallback -= 1;
+      }
       const result = validateRelayJson(raw);
       await hitFailpoint(
         points,
@@ -166,8 +187,140 @@ export async function runActivation(options: {
     }
   };
 
+  const parallel = async (
+    group: string,
+    children: readonly ParallelChild[],
+    optionsParallel?: { concurrency?: number },
+  ): Promise<Json[]> => {
+    if (inStep || inCallback > 0) {
+      throw namedError("ConcurrentCommand", "nested command");
+    }
+    const concurrency = optionsParallel?.concurrency ?? 4;
+    if (!validKey(group)) throw namedError("Serialization", "group key is invalid");
+    if (seenGroups.has(group)) throw namedError("DuplicateStepKey", "duplicate parallel group");
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 64) {
+      throw namedError("Serialization", "concurrency must be from 1 to 64");
+    }
+    if (children.length > 1000) throw namedError("Serialization", "parallel group exceeds 1000 children");
+    const names: string[] = [];
+    const localNames = new Set<string>();
+    for (const child of children) {
+      if (!validKey(child.name)) throw namedError("Serialization", "child step key is invalid");
+      if (localNames.has(child.name) || seen.has(child.name)) throw namedError("DuplicateStepKey", "duplicate step key");
+      localNames.add(child.name);
+      names.push(child.name);
+    }
+    const position = nextPos;
+    const expected = {
+      kind: "parallel" as const,
+      key: group,
+      children: names,
+      concurrency,
+      explicitInput: false as const,
+    };
+    const historical = commands[position];
+    if (historical && !sameParallel(historical.descriptor, expected)) {
+      throw nondeterminism(position, historical.descriptor, expected);
+    }
+    inStep = true;
+    try {
+      for (const name of names) seen.add(name);
+      seenGroups.add(group);
+      nextPos += 1;
+      if (!historical) {
+        await postIntent(options, sessionId, runId, fence, {
+          kind: "declare_parallel",
+          groupKey: group,
+          expectedCommandPos: String(position),
+          children: names,
+          concurrency,
+        }, options.completionRequestPath, control);
+      }
+      const outcomes = await settleParallel({
+        children,
+        concurrency,
+        historical: Boolean(historical),
+        childStates,
+        onFatal: () => abort.abort(),
+        runChild: (child, restart) => runParallelChild(child, restart),
+      });
+      const results: Json[] = [];
+      const failures: ParallelFailure[] = [];
+      outcomes.forEach((outcome, index) => {
+        if (outcome.status === "ok") {
+          results.push(outcome.result);
+          return;
+        }
+        results.push(null);
+        failures.push({ index, stepKey: names[index] ?? "", error: outcome.error });
+      });
+      if (failures.length > 0) {
+        throw new ParallelStepError(failures, results);
+      }
+      return results;
+    } finally {
+      inStep = false;
+    }
+
+    async function runParallelChild(child: ParallelChild, restart: boolean): Promise<ChildOutcome> {
+      const started = restart
+        ? await postIntent(options, sessionId, runId, fence, {
+            kind: "restart_attempt",
+            stepKey: child.name,
+          }, options.completionRequestPath, control)
+        : await postIntent(options, sessionId, runId, fence, {
+            kind: "start_attempt",
+            stepKey: child.name,
+          }, options.completionRequestPath, control);
+      const attempt = Number(started.attempt);
+      const attemptToken = String(started.attemptToken);
+      await hitFailpoint(points, "step.after-start-commit-before-callback", { runId, stepKey: child.name, attempt }, options.barrierDir);
+      inCallback += 1;
+      try {
+        let raw: Json;
+        try {
+          raw = await child.run({
+            idempotencyKey: logicalStepIdempotencyKey(tenantId, runId, child.name),
+            attempt,
+            attemptToken,
+            signal: abort.signal,
+          });
+        } catch (error) {
+          if (error instanceof WorkerHttpError || control.lost) throw error;
+          if (error instanceof Error && (error.name === "ConcurrentCommand" || error.name === "Nondeterminism" || error.name === "DuplicateStepKey" || error.name === "Serialization")) {
+            throw error;
+          }
+          const message = error instanceof Error && error.message.length > 0 ? error.message : "step failed";
+          const failure = { code: "StepFailed" as const, message };
+          await postIntent(options, sessionId, runId, fence, {
+            kind: "fail_step",
+            stepKey: child.name,
+            attempt,
+            attemptToken,
+            error: failure,
+          }, options.completionRequestPath, control);
+          return { status: "failed", error: failure };
+        }
+        const result = validateRelayJson(raw);
+        await hitFailpoint(points, "step.after-user-function-before-completion", { runId, stepKey: child.name, attempt }, options.barrierDir);
+        if (control.lost) throw new Error("lease lost");
+        const completed = await postIntent(options, sessionId, runId, fence, {
+          kind: "complete_step",
+          stepKey: child.name,
+          attempt,
+          attemptToken,
+          result,
+        }, options.completionRequestPath, control);
+        await hitFailpoint(points, "step.after-completion-commit-before-response", { runId, stepKey: child.name, attempt }, options.barrierDir);
+        return { status: "ok", result: validateRelayJson(completed.result ?? result) };
+      } finally {
+        inCallback -= 1;
+      }
+    }
+  };
+
   try {
-    const output = await options.workflow.fn({ step }, input);
+    const output = await options.workflow.fn({ step: Object.assign(step, { parallel }) }, input);
     beats.stop();
     if (control.lost) throw new Error("lease lost");
     if (nextPos < commands.length) {
@@ -329,16 +482,16 @@ function inputFromHistory(events: HistoryEvent[]): Json {
   return validateRelayJson(created.payload.input ?? null);
 }
 
-function indexCommands(events: HistoryEvent[]): StepHistory[] {
-  const commands: StepHistory[] = [];
+function indexCommands(events: HistoryEvent[]): CommandHistory[] {
+  const commands: CommandHistory[] = [];
   for (const event of events) {
-    if (event.type === "CommandRecorded" && event.payload.descriptor && typeof event.payload.descriptor === "object") {
-      const descriptor = event.payload.descriptor as StepHistory["descriptor"];
+    if (event.type === "CommandRecorded" && event.payload.descriptor && typeof event.payload.descriptor === "object" && !Array.isArray(event.payload.descriptor)) {
+      const descriptor = event.payload.descriptor;
       const position = Number(event.commandPos ?? commands.length);
       commands[position] = { descriptor, completed: false };
     }
     if (event.type === "StepCompleted" && event.stepKey) {
-      const command = commands.find((item) => item?.descriptor.key === event.stepKey);
+      const command = commands.find((item) => item?.descriptor.kind === "step" && item.descriptor.key === event.stepKey);
       if (command) {
         command.completed = true;
         command.result = event.payload.result;
@@ -346,6 +499,125 @@ function indexCommands(events: HistoryEvent[]): StepHistory[] {
     }
   }
   return commands;
+}
+
+function indexChildren(events: HistoryEvent[]): Map<string, ChildHistory> {
+  const children = new Map<string, ChildHistory>();
+  for (const event of events) {
+    if (!event.stepKey) continue;
+    const current = children.get(event.stepKey);
+    if ((event.type === "StepStarted" || event.type === "StepAttemptAbandoned") && current?.terminal !== "completed" && current?.terminal !== "failed") {
+      children.set(event.stepKey, { terminal: "open" });
+    }
+    if (event.type === "StepCompleted") {
+      children.set(event.stepKey, { terminal: "completed", result: event.payload.result });
+    }
+    if (event.type === "StepFailed") {
+      children.set(event.stepKey, { terminal: "failed", error: event.payload.error });
+    }
+  }
+  return children;
+}
+
+type ChildOutcome = {
+  status: "ok";
+  result: Json;
+} | {
+  status: "failed";
+  error: { code: "StepFailed"; message: string };
+};
+
+async function settleParallel(input: {
+  children: readonly ParallelChild[];
+  concurrency: number;
+  historical: boolean;
+  childStates: Map<string, ChildHistory>;
+  onFatal: () => void;
+  runChild: (child: ParallelChild, restart: boolean) => Promise<ChildOutcome>;
+}): Promise<ChildOutcome[]> {
+  const outcomes: Array<ChildOutcome | undefined> = new Array(input.children.length);
+  let cursor = 0;
+  let running = 0;
+  let fatal: unknown;
+  let settled = false;
+  await new Promise<void>((resolve, reject) => {
+    const finish = () => {
+      if (settled) return;
+      if (running === 0 && (cursor >= input.children.length || fatal)) {
+        settled = true;
+        if (fatal) reject(fatal);
+        else resolve();
+      }
+    };
+    const pump = () => {
+      if (settled) return;
+      while (!fatal && running < input.concurrency && cursor < input.children.length) {
+        const index = cursor;
+        cursor += 1;
+        const child = input.children[index];
+        if (!child) continue;
+        const record = input.historical ? input.childStates.get(child.name) : undefined;
+        if (record?.terminal === "completed") {
+          outcomes[index] = { status: "ok", result: validateRelayJson(record.result ?? null) };
+          continue;
+        }
+        if (record?.terminal === "failed") {
+          outcomes[index] = { status: "failed", error: storedFailure(record.error) };
+          continue;
+        }
+        running += 1;
+        void input.runChild(child, record?.terminal === "open")
+          .then((outcome) => {
+            outcomes[index] = outcome;
+          })
+          .catch((error: unknown) => {
+            fatal = fatal ?? error;
+            input.onFatal();
+          })
+          .finally(() => {
+            running -= 1;
+            pump();
+            finish();
+          });
+      }
+      finish();
+    };
+    pump();
+  });
+  return outcomes.map((outcome) => {
+    if (!outcome) throw new Error("missing parallel outcome");
+    return outcome;
+  });
+}
+
+function storedFailure(error: Json | undefined): { code: "StepFailed"; message: string } {
+  if (typeof error === "object" && error !== null && !Array.isArray(error) && error.code === "StepFailed" && typeof error.message === "string" && error.message.length > 0) {
+    return { code: "StepFailed", message: error.message };
+  }
+  return { code: "StepFailed", message: "step failed" };
+}
+
+function sameParallel(
+  descriptor: { [key: string]: Json },
+  expected: { kind: "parallel"; key: string; children: string[]; concurrency: number; explicitInput: false },
+): boolean {
+  return descriptor.kind === expected.kind
+    && descriptor.key === expected.key
+    && descriptor.explicitInput === expected.explicitInput
+    && descriptor.concurrency === expected.concurrency
+    && Array.isArray(descriptor.children)
+    && descriptor.children.length === expected.children.length
+    && descriptor.children.every((child, index) => child === expected.children[index]);
+}
+
+function validKey(value: string): boolean {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value) <= 256;
+}
+
+function namedError(name: string, message: string): Error {
+  const error = new Error(message);
+  error.name = name;
+  return error;
 }
 
 function nondeterminism(position: number, expected: Json, actual: Json | null, reason = "command descriptor mismatch"): Error {

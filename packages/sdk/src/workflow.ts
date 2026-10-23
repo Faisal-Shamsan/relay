@@ -7,8 +7,38 @@ export interface StepContext {
   readonly signal: AbortSignal;
 }
 
+export interface ParallelChild {
+  name: string;
+  run: (stepCtx: StepContext) => Promise<Json>;
+}
+
+export interface ParallelFailure {
+  index: number;
+  stepKey: string;
+  error: { code: "StepFailed"; message: string };
+}
+
+export class ParallelStepError extends Error {
+  readonly failures: readonly ParallelFailure[];
+  readonly results: readonly (Json | null)[];
+
+  constructor(failures: readonly ParallelFailure[], results: readonly (Json | null)[]) {
+    super("parallel step failed");
+    this.name = "ParallelStepError";
+    this.failures = failures;
+    this.results = results;
+  }
+}
+
 export interface WorkflowContext {
-  step(name: string, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json>;
+  step: {
+    (name: string, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json>;
+    parallel(
+      group: string,
+      children: readonly ParallelChild[],
+      options?: { concurrency?: number },
+    ): Promise<Json[]>;
+  };
 }
 
 export interface WorkflowDefinition {

@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 1, milestone M4 complete. Phase 1 is not complete.
+Phase 1, milestone M5 complete. Phase 1 is not complete.
 
 ## Completed
 
@@ -13,6 +13,7 @@ Phase 1, milestone M4 complete. Phase 1 is not complete.
 - M2: heartbeat, explicit release, and a reaper. A stale owner cannot renew or write after expiry or a newer grant. Client clocks do not choose deadlines.
 - M3: a crash after an external effect and before completion runs the callback again with the same provider key. Finish-run crashes before commit roll back together. A changed body with the same operation id conflicts.
 - M4: duplicate step keys fail before the second callback. Reordered, removed, and inserted commands diverge before the new callback. A captured value with the same command shape is not detected.
+- M5: a parallel group declares every child in one transaction. A completed child is memoized, an active child restarts, and a failed child stays exhausted. Reversed completion order does not change discovery ordinals or the returned result order.
 
 ## In progress
 
@@ -28,6 +29,8 @@ A fake provider in the test worker records invocations and effects. F05 is `test
 
 Structural replay compares the command at each position before calling the user function. F10, F11, and F12 are in `tests/structure.test.ts`.
 
+`ctx.step.parallel` records the group and its children before any callback. Each child start, completion, and failure commits independently. F08 and F09 are in `tests/parallel.test.ts`. Phase 1 does not retry an exhausted child.
+
 ## Known issues
 
 - F02 stream writes are not implemented. They belong to Phase 2.
@@ -36,8 +39,8 @@ Structural replay compares the command at each position before calling the user 
 
 ## Next milestone
 
-M5: bounded parallel steps.
+M6: admission and recovery budget.
 
 ## Next task
 
-Memoized and recovered parallel children, and deterministic completion order (F08, F09).
+Identical triggers, conflicting keys, pinned version routing, and direct invalid writes (F17, F19, F21), plus recovery-budget exhaustion.

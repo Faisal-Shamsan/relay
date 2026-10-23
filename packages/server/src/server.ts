@@ -255,6 +255,37 @@ async function dispatchIntent(
       [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, stepKey, expected, ctx.hash],
     );
   }
+  if (kind === "declare_parallel") {
+    const children = intent.children;
+    if (!Array.isArray(children) || children.some((child) => typeof child !== "string")) {
+      throw new HttpError(422, "Serialization", "children must be an array of strings");
+    }
+    if (typeof intent.concurrency !== "number" || !Number.isInteger(intent.concurrency)) {
+      throw new HttpError(422, "Serialization", "concurrency must be an integer");
+    }
+    return callJson(
+      pool,
+      `SELECT relay_declare_parallel($1,$2,$3,$4::bigint,$5,$6::bigint,$7::jsonb,$8,$9) AS result`,
+      [
+        ctx.operationId,
+        ctx.sessionId,
+        ctx.runId,
+        ctx.fence,
+        requiredString(intent, "groupKey"),
+        decimalString(intent.expectedCommandPos, "expectedCommandPos"),
+        JSON.stringify(children),
+        intent.concurrency,
+        ctx.hash,
+      ],
+    );
+  }
+  if (kind === "start_attempt") {
+    return callJson(
+      pool,
+      `SELECT relay_start_attempt($1,$2,$3,$4::bigint,$5,$6) AS result`,
+      [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, requiredString(intent, "stepKey"), ctx.hash],
+    );
+  }
   if (kind === "restart_attempt") {
     return callJson(
       pool,
@@ -281,6 +312,29 @@ async function dispatchIntent(
         intent.attempt,
         requiredString(intent, "attemptToken"),
         JSON.stringify(intent.result ?? null),
+        ctx.hash,
+      ],
+    );
+  }
+  if (kind === "fail_step") {
+    if (typeof intent.attempt !== "number" || !Number.isInteger(intent.attempt)) {
+      throw new HttpError(422, "Serialization", "attempt must be an integer");
+    }
+    if (typeof intent.error !== "object" || intent.error === null || Array.isArray(intent.error)) {
+      throw new HttpError(422, "Serialization", "error is required");
+    }
+    return callJson(
+      pool,
+      `SELECT relay_fail_step($1,$2,$3,$4::bigint,$5,$6,$7,$8::jsonb,$9) AS result`,
+      [
+        ctx.operationId,
+        ctx.sessionId,
+        ctx.runId,
+        ctx.fence,
+        requiredString(intent, "stepKey"),
+        intent.attempt,
+        requiredString(intent, "attemptToken"),
+        JSON.stringify(intent.error),
         ctx.hash,
       ],
     );
