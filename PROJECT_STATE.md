@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 1, milestone M2 complete. Phase 1 is not complete.
+Phase 1, milestone M3 complete. Phase 1 is not complete.
 
 ## Completed
 
@@ -11,6 +11,7 @@ Phase 1, milestone M2 complete. Phase 1 is not complete.
 - Repository control structure created.
 - M1: one sequential step. A crash before completion restarts the attempt. A later attempt completes. Replay returns the stored result without calling the user function. A duplicate completion returns the stored receipt.
 - M2: heartbeat, explicit release, and a reaper. A stale owner cannot renew or write after expiry or a newer grant. Client clocks do not choose deadlines.
+- M3: a crash after an external effect and before completion runs the callback again with the same provider key. Finish-run crashes before commit roll back together. A changed body with the same operation id conflicts.
 
 ## In progress
 
@@ -22,6 +23,8 @@ One sequential `ctx.step`. Crash before completion, lease expiry, a later attemp
 
 Heartbeat renewal, explicit release, and a server reaper that expires one due lease per transaction. Fencing proofs F03, F04, F07, and F20, plus F02 without stream writes, are in `packages/server/test/fencing.test.ts`. The SDK heartbeat loop is covered by `tests/heartbeat.test.ts`.
 
+A fake provider in the test worker records invocations and effects. F05 is `tests/effects.test.ts`. Finish-run failpoints abort the transaction in `packages/server/sql/003_m3.sql`; F16 is `packages/server/test/atomicity.test.ts`. F18 is `packages/server/test/idempotency.test.ts`.
+
 ## Known issues
 
 - F02 stream writes are not implemented. They belong to Phase 2.
@@ -30,8 +33,8 @@ Heartbeat renewal, explicit release, and a server reaper that expires one due le
 
 ## Next milestone
 
-M3: effects and atomicity.
+M4: structural replay.
 
 ## Next task
 
-Provider-effect idempotency, intra-transaction rollback, and conflicting operation-id proofs (F05, F16, F18).
+Duplicate step keys, structural divergence, and the case structural replay does not detect (F10, F11, F12).

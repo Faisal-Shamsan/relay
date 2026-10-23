@@ -13,6 +13,8 @@ test("server source does not load workflow functions or expose a failpoint route
     assert.equal(source.includes("defineWorkflow"), false, file);
     assert.equal(source.includes("@relay/sdk"), false, file);
     assert.equal(source.includes("/failpoint"), false, file);
+    assert.equal(source.includes("relay.failpoint"), false, file);
+    assert.equal(source.includes("relay.allow_failpoints"), false, file);
     assert.equal(source.includes("/v1/runs/:id/events"), false, file);
   }
 });

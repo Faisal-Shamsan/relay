@@ -1,10 +1,12 @@
 import { appendFileSync } from "node:fs";
+import { recordFakeProvider } from "./fake-provider.js";
 import { readFailpointFile } from "./failpoints.js";
 import { runActivation } from "./worker.js";
 import { defineWorkflow } from "./workflow.js";
 
 const serverUrl = requiredEnv("RELAY_SERVER_URL");
 const invocationLog = requiredEnv("RELAY_INVOCATION_LOG");
+const providerLog = process.env.RELAY_PROVIDER_LOG;
 const failpointFile = process.env.RELAY_FAILPOINT_FILE;
 if (failpointFile) process.env.RELAY_ALLOW_FAILPOINTS = "1";
 
@@ -14,6 +16,17 @@ const workflow = defineWorkflow({ name: "demo", version: "demo-v1" }, async (ctx
       invocationLog,
       `${JSON.stringify({ attempt: stepCtx.attempt, idempotencyKey: stepCtx.idempotencyKey })}\n`,
     );
+    if (providerLog) {
+      recordFakeProvider(
+        providerLog,
+        {
+          attempt: stepCtx.attempt,
+          attemptToken: stepCtx.attemptToken,
+          idempotencyKey: stepCtx.idempotencyKey,
+        },
+        process.env.RELAY_PROVIDER_DEDUPE === "1",
+      );
+    }
     return { ok: true };
   });
 });

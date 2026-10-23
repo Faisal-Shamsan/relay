@@ -601,11 +601,11 @@ async function waitForLock(admin: pg.Client, name: string): Promise<void> {
 async function waitUntilExpired(admin: pg.Client, runId: string): Promise<void> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
-    const row = await admin.query<{ due: boolean }>(
-      `SELECT clock_timestamp() >= lease_expires_at AS due FROM run_queue WHERE run_id = $1`,
+    const row = await admin.query<{ due: boolean | null; state: string }>(
+      `SELECT clock_timestamp() >= lease_expires_at AS due, state FROM run_queue WHERE run_id = $1`,
       [runId],
     );
-    if (row.rows[0]?.due) return;
+    if (row.rows[0]?.due || row.rows[0]?.state === "ready") return;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error("lease did not expire");
