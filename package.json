@@ -8,6 +8,7 @@
   "scripts": {
     "typecheck": "tsc -b",
     "build": "tsc -b",
+    "start": "node packages/server/dist/src/main.js",
     "test": "node scripts/ensure-postgres.mjs && tsc -b && node --test --test-concurrency=1 packages/protocol/dist/test/*.test.js packages/sdk/dist/test/*.test.js packages/server/dist/test/*.test.js tests/dist/*.test.js"
   },
   "devDependencies": {

@@ -112,8 +112,10 @@ test("http completion receipt survives a later fence and a foreign version canno
     );
     assert.equal(completions.rows[0]?.count, "1");
 
-    const missingEvents = await fetch(`${server.url}/v1/runs/${runId}/events`);
-    assert.equal(missingEvents.status, 404);
+    const recorded = await fetch(`${server.url}/v1/runs/${runId}/events`);
+    assert.equal(recorded.status, 200);
+    const recordedBody = await recorded.json() as { events: Array<{ type: string }> };
+    assert.equal(recordedBody.events.some((event) => event.type === "StepCompleted"), true);
     const missingFailpoint = await fetch(`${server.url}/failpoint`);
     assert.equal(missingFailpoint.status, 404);
 
