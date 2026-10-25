@@ -554,8 +554,30 @@ test("F02 a stale owner cannot complete, heartbeat, or release after a new grant
     assert.equal(after.rows[0]!.fence, "2");
     assert.equal(after.rows[0]!.completed, "1");
 
-    const stream = await fetch(`${server.url}/worker/v1/stream`, { method: "POST" });
-    assert.equal(stream.status, 404);
+    const stream = await post(server.url, "/worker/v1/stream", {
+      protocolVersion: 1,
+      operationId: randomUUID(),
+      workerSessionId: ownerA,
+      runId,
+      fence: "1",
+      stepKey: "only",
+      attempt: started.body.attempt,
+      attemptToken: started.body.attemptToken,
+      batchSeq: "0",
+      text: "stale",
+    });
+    assert.equal(stream.status, 409);
+    assert.equal(stream.body.code, "LeaseLost");
+    const chunks = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM run_stream_events WHERE run_id = $1 AND kind = 'chunk'`,
+      [runId],
+    );
+    assert.equal(chunks.rows[0]?.count, "0");
+    const stillOwned = await admin.query<{ owner: string }>(
+      `SELECT lease_owner::text AS owner FROM run_queue WHERE run_id = $1`,
+      [runId],
+    );
+    assert.equal(stillOwned.rows[0]?.owner, ownerB);
     const events = await fetch(`${server.url}/v1/runs/${runId}/events`);
     assert.equal(events.status, 200);
     const page = await events.json() as { events: Array<{ type: string }> };

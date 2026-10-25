@@ -1,13 +1,13 @@
 # Test matrix
 
-Starter matrix from [spec.md](spec.md) §12.2. Every row is a required failure scenario. F01 and F06 are covered by the M1 exit test. F03, F04, F07, and F20 are covered by the M2 fencing tests. F02 is covered except stream writes, which stay Phase 2. F05, F16, and F18 are covered by the M3 proofs. F10, F11, and F12 are covered by the M4 structural replay tests. F08 and F09 are covered by the M5 parallel tests. F17, F19, and F21 are covered by the M6 admission tests. F15 and F22 are covered by the M7 gate. Every Phase 2 row is still not implemented.
+Starter matrix from [spec.md](spec.md) §12.2. Every row is a required failure scenario. F01 and F06 are covered by the M1 exit test. F03, F04, F07, and F20 are covered by the M2 fencing tests. F02, including a stale stream append, is covered by the fencing tests. F05, F16, and F18 are covered by the M3 proofs. F10, F11, and F12 are covered by the M4 structural replay tests. F08 and F09 are covered by the M5 parallel tests. F17, F19, and F21 are covered by the M6 admission tests. F15 and F22 are covered by the M7 gate. F23 through F28 are covered by the M8 stream log. F29 through F35 are not implemented.
 
 Invariant IDs refer to [invariants.md](invariants.md). Where no ledger ID is the primary claim, the invariant cell is `—`.
 
 | Scenario | Expected behaviour | Invariant | Test | Status |
 |---|---|---|---|---|
 | F01 (Phase 1): Worker killed mid-step, during the callback | Unfinished attempt restarts. Committed successes do not rerun. | INV-001 | tests/exit.test.ts | Implemented |
-| F02 (Phase 1; stream extension Phase 2): Stale worker wakes after lease expiry and a new grant | The old worker's new event, completion, heartbeat, release, and stream writes are rejected. The new worker remains owner. | INV-002 | packages/server/test/fencing.test.ts | Implemented except stream writes |
+| F02 (Phase 1; stream extension Phase 2): Stale worker wakes after lease expiry and a new grant | The old worker's new event, completion, heartbeat, release, and stream writes are rejected. The new worker remains owner. | INV-002 | packages/server/test/fencing.test.ts | Implemented |
 | F03 (Phase 1): Lease expired, reaper has not run | The old holder cannot renew or write, even with an unchanged fence. | INV-007 | packages/server/test/fencing.test.ts | Implemented |
 | F04 (Phase 1): Request waits on the run lock past expiry | Post-lock database time rejects stale ownership. | INV-007 | packages/server/test/fencing.test.ts | Implemented |
 | F05 (Phase 1): Crash after an external side effect but before the completion commit | The callback may run twice. The stable provider key is unchanged. Deduplication occurs only when the fake provider supports it. | INV-012 | tests/effects.test.ts | Implemented |
@@ -28,12 +28,12 @@ Invariant IDs refer to [invariants.md](invariants.md). Where no ledger ID is the
 | F20 (Phase 1): Worker clocks intentionally skewed | Lease, grant, and expiry decisions depend only on Postgres time. | INV-007 | packages/server/test/fencing.test.ts, tests/heartbeat.test.ts | Implemented |
 | F21 (Phase 1): Direct invalid state, tenant foreign key, or unauthorized DML | Constraint or privilege rejection. No persisted invalid row. | — | packages/server/test/admission.test.ts | Implemented |
 | F22 (Phase 1): Database disconnect or failover around commit | Unknown outcome is resolved from receipts and history. No assumption of rollback. Failover RPO is disclosed. | INV-004 | packages/server/test/failover.test.ts, README.md | Implemented |
-| F23 (Phase 2): Duplicate stream-batch retry. Commit a batch, drop the response, and retry | One batch row, the same stream sequence, and an unchanged last-batch counter. | INV-008, INV-010 | — | Not implemented |
-| F24 (Phase 2): Reuse a batch ID with different text, or send a gap | Conflict or gap is rejected. No partial update. | INV-008 | — | Not implemented |
-| F25 (Phase 2): Streaming step retry. Crash after the final flush but before completion | Durable old output is superseded on recovery. A new attempt is authorized. | INV-008 | — | Not implemented |
-| F26 (Phase 2): Request completion before the final batch is persisted | Manifest validation rejects it. SDK tests ensure the flush is awaited. | INV-008 | — | Not implemented |
-| F27 (Phase 2): Crash after the completion commit | All declared final chunks and the completion control are present. No new attempt. | INV-001, INV-008 | — | Not implemented |
-| F28 (Phase 2): Streaming supersession. Interleave streams A and B, then restart A | Supersession removes only A's old output. B remains unchanged. | INV-014 | — | Not implemented |
+| F23 (Phase 2): Duplicate stream-batch retry. Commit a batch, drop the response, and retry | One batch row, the same stream sequence, and an unchanged last-batch counter. | INV-008, INV-010 | tests/stream.test.ts | Implemented |
+| F24 (Phase 2): Reuse a batch ID with different text, or send a gap | Conflict or gap is rejected. No partial update. | INV-008 | tests/stream.test.ts | Implemented |
+| F25 (Phase 2): Streaming step retry. Crash after the final flush but before completion | Durable old output is superseded on recovery. A new attempt is authorized. | INV-008 | tests/stream.test.ts | Implemented |
+| F26 (Phase 2): Request completion before the final batch is persisted | Manifest validation rejects it. SDK tests ensure the flush is awaited. | INV-008 | tests/stream.test.ts | Implemented |
+| F27 (Phase 2): Crash after the completion commit | All declared final chunks and the completion control are present. No new attempt. | INV-001, INV-008 | tests/stream.test.ts | Implemented |
+| F28 (Phase 2): Streaming supersession. Interleave streams A and B, then restart A | Supersession removes only A's old output. B remains unchanged. | INV-014 | tests/stream.test.ts | Implemented |
 | F29 (Phase 2): Stream reconnect. Disconnect across a supersession and reconnect after the last chunk | The control event is replayed through the same cursor. The reducer matches a continuous connection. | INV-014 | — | Not implemented |
 | F30 (Phase 2): Commit between SSE setup and catch-up, and drop notifications | Catch-up and polling still deliver all retained events in order. | INV-014 | — | Not implemented |
 | F31 (Phase 2): Slow browser and listener reconnect | Bounded buffers. No per-browser database connection. Durable resumption. | INV-014 | — | Not implemented |

@@ -30,6 +30,7 @@ export type WorkerIntent =
       attempt: number;
       attemptToken: string;
       result: Json;
+      finalBatchSeq?: string;
     }
   | {
       kind: "fail_step";

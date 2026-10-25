@@ -288,6 +288,35 @@ async function route(
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/worker/v1/stream") {
+    const body = await readJson(req);
+    requireProtocol(body);
+    const text = requiredString(body, "text");
+    if (text.length === 0) throw new HttpError(422, "Serialization", "stream batch text is empty");
+    if (typeof body.attempt !== "number" || !Number.isInteger(body.attempt)) {
+      throw new HttpError(422, "Serialization", "attempt must be an integer");
+    }
+    const result = await callJson(
+      pool,
+      `SELECT relay_append_stream_batch($1,$2,$3,$4::bigint,$5,$6,$7,$8::bigint,$9,$10,$11) AS result`,
+      [
+        requiredString(body, "operationId"),
+        requiredString(body, "workerSessionId"),
+        requiredString(body, "runId"),
+        decimalString(body.fence, "fence"),
+        requiredString(body, "stepKey"),
+        body.attempt,
+        requiredString(body, "attemptToken"),
+        decimalString(body.batchSeq, "batchSeq"),
+        text,
+        canonicalHash(text),
+        canonicalHash(body),
+      ],
+    );
+    sendJson(res, 200, result);
+    return;
+  }
+
   const history = /^\/worker\/v1\/runs\/([0-9a-fA-F-]{36})\/history$/.exec(url.pathname);
   if (req.method === "GET" && history) {
     const runId = history[1];
@@ -425,7 +454,7 @@ async function dispatchIntent(
     }
     return callJson(
       pool,
-      `SELECT relay_complete_step($1,$2,$3,$4::bigint,$5,$6,$7,$8::jsonb,$9) AS result`,
+      `SELECT relay_complete_step($1,$2,$3,$4::bigint,$5,$6,$7,$8::jsonb,$9,$10::bigint) AS result`,
       [
         ctx.operationId,
         ctx.sessionId,
@@ -436,6 +465,7 @@ async function dispatchIntent(
         requiredString(intent, "attemptToken"),
         JSON.stringify(intent.result ?? null),
         ctx.hash,
+        finalBatchSeq(intent.finalBatchSeq),
       ],
     );
   }
@@ -551,6 +581,12 @@ function idempotencyHeader(req: IncomingMessage): string | null {
     throw new HttpError(422, "Serialization", "Idempotency-Key length is invalid");
   }
   return header;
+}
+
+function finalBatchSeq(value: unknown): string {
+  if (value === undefined) return "-1";
+  if (value === "-1") return "-1";
+  return decimalString(value, "finalBatchSeq");
 }
 
 function pageLimit(raw: string | null): number {

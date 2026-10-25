@@ -21,6 +21,9 @@ const STATUS: Record<string, number> = {
   DuplicateStepKey: 409,
   Nondeterminism: 409,
   NotExpired: 409,
+  StreamBatchConflict: 409,
+  StreamGap: 409,
+  StreamManifest: 409,
 };
 
 export function fromDatabaseError(error: unknown): HttpError | null {

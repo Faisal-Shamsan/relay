@@ -5,6 +5,7 @@ export interface StepContext {
   readonly attempt: number;
   readonly attemptToken: string;
   readonly signal: AbortSignal;
+  emit(text: string): Promise<void>;
 }
 
 export interface ParallelChild {
