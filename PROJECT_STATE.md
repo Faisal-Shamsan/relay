@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 1, milestone M6 complete. Phase 1 is not complete.
+Phase 1 complete. Phase 2 is not started.
 
 ## Completed
 
@@ -15,6 +15,7 @@ Phase 1, milestone M6 complete. Phase 1 is not complete.
 - M4: duplicate step keys fail before the second callback. Reordered, removed, and inserted commands diverge before the new callback. A captured value with the same command shape is not detected.
 - M5: a parallel group declares every child in one transaction. A completed child is memoized, an active child restarts, and a failed child stays exhausted. Reversed completion order does not change discovery ordinals or the returned result order.
 - M6: an identical trigger returns the same run, and a different intent conflicts. A pinned v1 run stays pending when only a v2 worker is live. Direct invalid writes do not persist. Exceeding the stored recovery budget fails the run instead of starting another attempt.
+- M7: the remaining Phase 1 failpoint hooks roll back with the transaction. Projection verification reports drift without rewriting history. Run and event reads are available. A dropped database connection is resolved from the receipt, and the failover recovery point is disclosed. The failure demo completes 100 runs.
 
 ## In progress
 
@@ -34,16 +35,19 @@ Structural replay compares the command at each position before calling the user 
 
 Trigger identity is the tenant plus the idempotency key. F17 is `packages/server/test/admission.test.ts`. `GET /v1/workflows` reports live compatible workers. F19 is in the same file. F21 rejects invalid state, a missing tenant, and direct application writes. A step stores its recovery ceiling at declaration. Exhaustion is `tests/recovery.test.ts`. The default ceiling is 100.
 
+Phase 1 hooks for grant, heartbeat, declaration, and completion abort the open transaction through the existing failpoint helper. The server still does not expose a failpoint route. `lease.after-commit-before-response` is in the SDK, after the lease response. `GET /v1/runs/:id` and paginated event reads are on the HTTP server. `relay_verify_projections` compares commands, steps, attempts, and business run fields with history and does not repair them. F22 is `packages/server/test/failover.test.ts`; the recovery-point disclosure is in `README.md`. The 100-run demo is `tests/demo.test.ts`. It prints measured activation times and separates callback counts from provider effects. Invalid JSON is rejected with a path in `packages/protocol/test/json.test.ts`.
+
 ## Known issues
 
 - F02 stream writes are not implemented. They belong to Phase 2.
-- `heartbeat.after-update-before-commit` is not implemented. That hook is inside the database transaction.
+- Stream catch-up, 1,000-run, and 10,000-run figures are not measured.
 - Recorded JSON ambiguities remain: the root counts as depth 1; unsafe integers are rejected rather than rewritten; SHA-256 is the receipt digest; no Unicode normalization.
+- External effects are at least once. Provider deduplication is not an exactly-once guarantee.
 
 ## Next milestone
 
-M7: Phase 1 gate.
+Phase 2 is not started.
 
 ## Next task
 
-Remaining failpoint hooks, projection verification, Phase 1 read APIs, the failover disclosure, the failure demo, and a runnable README.
+None. Do not start Phase 2 until asked.

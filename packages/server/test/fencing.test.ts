@@ -557,7 +557,9 @@ test("F02 a stale owner cannot complete, heartbeat, or release after a new grant
     const stream = await fetch(`${server.url}/worker/v1/stream`, { method: "POST" });
     assert.equal(stream.status, 404);
     const events = await fetch(`${server.url}/v1/runs/${runId}/events`);
-    assert.equal(events.status, 404);
+    assert.equal(events.status, 200);
+    const page = await events.json() as { events: Array<{ type: string }> };
+    assert.equal(page.events.some((event) => event.type === "StepCompleted"), true);
   } finally {
     await admin.end();
     await server.close();

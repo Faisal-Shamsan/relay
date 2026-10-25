@@ -135,6 +135,83 @@ async function route(
     return;
   }
 
+  const runMatch = /^\/v1\/runs\/([0-9a-fA-F-]{36})$/.exec(url.pathname);
+  if (req.method === "GET" && runMatch) {
+    const runId = runMatch[1];
+    const row = await withTransaction(pool, async (client) => {
+      const found = await client.query(
+        `SELECT r.state,
+                r.output,
+                r.error,
+                r.current_fence::text AS fence,
+                wv.name AS "workflowName",
+                wv.version AS "workflowVersion",
+                q.state AS "queueState",
+                q.lease_owner::text AS "leaseOwner",
+                to_jsonb(q.lease_expires_at) #>> '{}' AS "leaseExpiresAt"
+         FROM runs r
+         JOIN workflow_versions wv ON wv.id = r.workflow_version_id
+         LEFT JOIN run_queue q ON q.run_id = r.id
+         WHERE r.id = $1 AND r.tenant_id = $2`,
+        [runId, SEEDED_TENANT_ID],
+      );
+      return found.rows[0] as {
+        state: string;
+        output: Json | null;
+        error: Json | null;
+        fence: string;
+        workflowName: string;
+        workflowVersion: string;
+        queueState: string | null;
+        leaseOwner: string | null;
+        leaseExpiresAt: string | null;
+      } | undefined;
+    });
+    if (!row) throw new HttpError(404, "InvalidRunState", "run not found");
+    sendJson(res, 200, {
+      runId,
+      workflowName: row.workflowName,
+      workflowVersion: row.workflowVersion,
+      state: row.state,
+      output: row.output,
+      error: row.error,
+      ownership: {
+        fence: row.fence,
+        queueState: row.queueState,
+        leaseOwner: row.leaseOwner,
+        leaseExpiresAt: row.leaseExpiresAt,
+      },
+    });
+    return;
+  }
+
+  const eventsMatch = /^\/v1\/runs\/([0-9a-fA-F-]{36})\/events$/.exec(url.pathname);
+  if (req.method === "GET" && eventsMatch) {
+    const runId = eventsMatch[1];
+    const after = url.searchParams.get("after") ?? "0";
+    if (!/^[0-9]+$/.test(after)) throw new HttpError(422, "Serialization", "after must be a decimal string");
+    const limit = pageLimit(url.searchParams.get("limit"));
+    const page = await withTransaction(pool, async (client) => {
+      const exists = await client.query(`SELECT 1 FROM runs WHERE id = $1 AND tenant_id = $2`, [runId, SEEDED_TENANT_ID]);
+      if (exists.rowCount === 0) return null;
+      const events = await client.query(
+        `SELECT seq::text AS seq, fence::text AS fence, actor, type,
+                command_pos::text AS "commandPos", step_key AS "stepKey", attempt, payload
+         FROM run_events
+         WHERE run_id = $1 AND seq > $2::bigint
+         ORDER BY seq
+         LIMIT $3`,
+        [runId, after, limit + 1],
+      );
+      return events.rows as Array<{ seq: string }>;
+    });
+    if (page === null) throw new HttpError(404, "InvalidRunState", "run not found");
+    const more = page.length > limit;
+    const events = more ? page.slice(0, limit) : page;
+    sendJson(res, 200, { events, next: more ? events[events.length - 1]?.seq ?? null : null });
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/worker/v1/register") {
     const body = await readJson(req);
     requireProtocol(body);
@@ -474,6 +551,16 @@ function idempotencyHeader(req: IncomingMessage): string | null {
     throw new HttpError(422, "Serialization", "Idempotency-Key length is invalid");
   }
   return header;
+}
+
+function pageLimit(raw: string | null): number {
+  const text = raw ?? "100";
+  if (!/^[0-9]+$/.test(text)) throw new HttpError(422, "Serialization", "limit must be a positive integer");
+  const limit = Number(text);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+    throw new HttpError(422, "Serialization", "limit must be from 1 to 1000");
+  }
+  return limit;
 }
 
 function requireNonNegativeInteger(value: number, name: string): number {

@@ -26,15 +26,40 @@ test("rejects values the specification excludes", () => {
     Object.assign(Object.create({ inherited: true }), { a: 1 }),
   ];
   for (const sample of samples) {
-    assert.throws(() => validateRelayJson(sample), RelayJsonError);
+    assert.throws(
+      () => validateRelayJson(sample),
+      (error: unknown) => {
+        assert.ok(error instanceof RelayJsonError);
+        assert.equal(error.path.startsWith("$"), true);
+        assert.equal(error.message.length > 0, true);
+        return true;
+      },
+    );
   }
+  assert.throws(
+    () => validateRelayJson({ outer: { inner: undefined } }),
+    (error: unknown) => {
+      assert.ok(error instanceof RelayJsonError);
+      assert.equal(error.path, "$.outer.inner");
+      assert.match(error.message, /undefined/);
+      return true;
+    },
+  );
   const cycle: { self?: unknown } = {};
   cycle.self = cycle;
   assert.throws(() => validateRelayJson(cycle), RelayJsonError);
 });
 
 test("rejects duplicate raw object keys before ordinary parsing", () => {
-  assert.throws(() => parseRelayJson('{"a":1,"a":2}'), /duplicate object key/);
+  assert.throws(
+    () => parseRelayJson('{"a":1,"a":2}'),
+    (error: unknown) => {
+      assert.ok(error instanceof RelayJsonError);
+      assert.equal(error.path, "$.a");
+      assert.match(error.message, /duplicate object key/);
+      return true;
+    },
+  );
 });
 
 test("requires an explicit null and rejects a sparse array", () => {

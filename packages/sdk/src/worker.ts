@@ -71,6 +71,7 @@ export async function runActivation(options: {
     throw new Error("leased workflow does not match the worker");
   }
   const runId = String(lease.runId);
+  await hitFailpoint(points, "lease.after-commit-before-response", { runId }, options.barrierDir);
   const fence = String(lease.fence);
   const watermark = String(lease.historyWatermark);
   const heartbeatIntervalMs = positiveInterval(lease.heartbeatIntervalMs);
