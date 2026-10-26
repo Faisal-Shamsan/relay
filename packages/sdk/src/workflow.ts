@@ -8,9 +8,14 @@ export interface StepContext {
   emit(text: string): Promise<void>;
 }
 
+export interface StepOptions {
+  input: Json;
+}
+
 export interface ParallelChild {
   name: string;
-  run: (stepCtx: StepContext) => Promise<Json>;
+  input?: Json;
+  run: (stepCtx: StepContext, input?: Json) => Promise<Json>;
 }
 
 export interface ParallelFailure {
@@ -34,6 +39,7 @@ export class ParallelStepError extends Error {
 export interface WorkflowContext {
   step: {
     (name: string, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json>;
+    (name: string, options: StepOptions, fn: (stepCtx: StepContext, input: Json) => Promise<Json>): Promise<Json>;
     parallel(
       group: string,
       children: readonly ParallelChild[],

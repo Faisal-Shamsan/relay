@@ -8,6 +8,8 @@ export type WorkerIntent =
       kind: "declare_and_start";
       stepKey: string;
       expectedCommandPos: string;
+      explicitInput?: boolean;
+      input?: Json;
     }
   | {
       kind: "declare_parallel";
@@ -15,6 +17,7 @@ export type WorkerIntent =
       expectedCommandPos: string;
       children: string[];
       concurrency: number;
+      childInputs?: Array<{ explicitInput: boolean; input?: Json }>;
     }
   | {
       kind: "start_attempt";

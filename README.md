@@ -1,5 +1,7 @@
 # Relay
 
+Status: early development. APIs will change. Not for production use.
+
 Relay is a self-hostable TypeScript durable-execution engine. [docs/spec.md](docs/spec.md) is authoritative. [PROJECT.md](PROJECT.md) says what the project is for. This file is how to run the Phase 1 server.
 
 Phase 1 stores workflow history in one Postgres database and recovers a crashed worker from that history. It does not claim exactly-once side effects.
@@ -88,7 +90,7 @@ The command compares commands, steps, attempts, and the business fields of the r
 - A step callback can run more than once. A committed result is not run again. A fake provider may skip a repeated effect; Relay does not make the external call exactly once.
 - Phase 1 does not retry a callback that threw. Crash recovery stops at the recovery budget stored on the step. The default is 100.
 - Workers advertise an exact workflow version. A run pinned to v1 stays pending while only a v2 worker is alive.
-- Replay compares command shape. A changed captured value with the same command shape is not detected.
+- Replay compares command shape. An explicit step input is fingerprinted, and a change is rejected before the stored result is returned. A changed captured value with the same command shape is not detected.
 - A worker can append a durable stream batch, and a client can resume that log over SSE. A finished run's stream log expires seven days after completion. The run result remains, and a later read returns 410. There is no timer, signal, dashboard, or metrics endpoint.
 - JSON follows the rules in `packages/protocol/src/json.ts`: the root counts as depth 1, unsafe integers are rejected, the receipt digest is SHA-256, and strings are not Unicode-normalized.
 - Invalid JSON is rejected with a path. It is not rewritten into a stored success.
@@ -98,3 +100,7 @@ The command compares commands, steps, attempts, and the business fields of the r
 Relay uses one Postgres primary. A response means that transaction committed. With Postgres `synchronous_commit` left at its default, `on`, that commit is durable on the primary. Relay does not ship a replica. If you add an async replica, its lag is your recovery point, and Relay does not measure that lag.
 
 A crash can lose a transaction that had not committed. If a request ends without a response, do not assume it rolled back and do not send a new operation id. Read the receipt or `GET /v1/runs/<id>/events`. The same operation id returns the stored result when the commit won, and performs the transition when it did not.
+
+## License
+
+Licensed under the Apache License 2.0. See LICENSE.
