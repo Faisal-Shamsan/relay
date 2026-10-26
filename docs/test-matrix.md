@@ -1,6 +1,6 @@
 # Test matrix
 
-Starter matrix from [spec.md](spec.md) §12.2. Every row is a required failure scenario. F01 and F06 are covered by the M1 exit test. F03, F04, F07, and F20 are covered by the M2 fencing tests. F02, including a stale stream append, is covered by the fencing tests. F05, F16, and F18 are covered by the M3 proofs. F10, F11, and F12 are covered by the M4 structural replay tests. F08 and F09 are covered by the M5 parallel tests. F17, F19, and F21 are covered by the M6 admission tests. F15 and F22 are covered by the M7 gate. F23 through F28 are covered by the M8 stream log. F29 through F31 are covered by the M9 live stream. F32 through F35 are not implemented.
+Starter matrix from [spec.md](spec.md) §12.2. Every row is a required failure scenario. F01 and F06 are covered by the M1 exit test. F03, F04, F07, and F20 are covered by the M2 fencing tests. F02, including a stale stream append, is covered by the fencing tests. F05, F16, and F18 are covered by the M3 proofs. F10, F11, and F12 are covered by the M4 structural replay tests. F08 and F09 are covered by the M5 parallel tests. F17, F19, and F21 are covered by the M6 admission tests. F15 and F22 are covered by the M7 gate. F23 through F28 are covered by the M8 stream log. F29 through F31 are covered by the M9 live stream. F32 is covered by the M10 retention test. F33 through F35 are not implemented.
 
 Invariant IDs refer to [invariants.md](invariants.md). Where no ledger ID is the primary claim, the invariant cell is `—`.
 
@@ -37,7 +37,7 @@ Invariant IDs refer to [invariants.md](invariants.md). Where no ledger ID is the
 | F29 (Phase 2): Stream reconnect. Disconnect across a supersession and reconnect after the last chunk | The control event is replayed through the same cursor. The reducer matches a continuous connection. | INV-014 | tests/sse.test.ts | Implemented |
 | F30 (Phase 2): Commit between SSE setup and catch-up, and drop notifications | Catch-up and polling still deliver all retained events in order. | INV-014 | tests/sse.test.ts | Implemented |
 | F31 (Phase 2): Slow browser and listener reconnect | Bounded buffers. No per-browser database connection. Durable resumption. | INV-014 | tests/sse.test.ts | Implemented |
-| F32 (Phase 2): Expire terminal stream history | 410. No silent partial reconstruction. Step results remain available. | INV-014 | — | Not implemented |
+| F32 (Phase 2): Expire terminal stream history | 410. No silent partial reconstruction. Step results remain available. | INV-014 | tests/retention.test.ts | Implemented |
 | F33 (Phase 2): Provider 429 or a deterministic poison callback | Persisted backoff and jitter are reused. Budgets are enforced. Unhandled exhaustion enters the failed-run view. | — | — | Not implemented |
 | F34 (Phase 2): Retry deadline while a parallel sibling is active | The sibling can finish. The run is not released prematurely. | — | — | Not implemented |
 | F35 (Phase 2): Crash during timer fire, with racing schedulers | One timer outcome and an atomic wakeup. The deadline is not recomputed. | INV-005 | — | Not implemented |

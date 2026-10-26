@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 1 complete. Phase 2 is in progress: the stream log and live SSE are implemented. Retention, helpers, timers, and retries are not.
+Phase 1 complete. Phase 2 is in progress: the stream log, live SSE, and seven-day retention are implemented. Helpers, timers, and retries are not.
 
 ## Completed
 
@@ -18,6 +18,7 @@ Phase 1 complete. Phase 2 is in progress: the stream log and live SSE are implem
 - M7: the remaining Phase 1 failpoint hooks roll back with the transaction. Projection verification reports drift without rewriting history. Run and event reads are available. A dropped database connection is resolved from the receipt, and the failover recovery point is disclosed. The failure demo completes 100 runs.
 - M8: a durable per-run stream log. A retried batch keeps one sequence. A conflicting or gapped batch writes nothing. Completion requires the flushed batch number. A crash after that flush supersedes only the interrupted attempt, and a crash after completion does not start another. A sibling's chunks stay in place.
 - M9: live SSE on the stream sequence. A shared listener only wakes readers. A client that reconnects across supersession matches one that stayed connected. A missed notification is recovered by catch-up or polling. A client that falls behind a bounded queue is disconnected, and a later batch still commits.
+- M10: seven-day stream retention. A terminal run's stream rows are deleted in the same locked transaction that sets `stream_expired_at`. The workflow history, step result, and stream sequence counter stay. A reader gets `410 StreamExpired` with the stored result, including a connection that was already open. An active run is left alone.
 
 ## In progress
 
@@ -39,7 +40,7 @@ Trigger identity is the tenant plus the idempotency key. F17 is `packages/server
 
 Phase 1 hooks for grant, heartbeat, declaration, and completion abort the open transaction through the existing failpoint helper. The server still does not expose a failpoint route. `lease.after-commit-before-response` is in the SDK, after the lease response. `GET /v1/runs/:id` and paginated event reads are on the HTTP server. `relay_verify_projections` compares commands, steps, attempts, business run fields, and the stream log with history. It does not repair them. F22 is `packages/server/test/failover.test.ts`; the recovery-point disclosure is in `README.md`. The 100-run demo is `tests/demo.test.ts`. It prints measured activation times and separates callback counts from provider effects. Invalid JSON is rejected with a path in `packages/protocol/test/json.test.ts`.
 
-`stepCtx.emit` appends UTF-8 batches to `run_stream_events` on `POST /worker/v1/stream`. One unacknowledged buffer is in flight. It flushes at about 100 ms, at 4 KiB, and before completion or failure. Completion, failure, finish, and restart commit `step_completed`, `step_failed`, `run_terminal`, or `superseded` in the same transaction as the workflow transition. F23 through F28 are in `tests/stream.test.ts`. `GET /v1/runs/:id/stream` serves those rows as SSE. One shared `LISTEN` connection wakes readers; it is not a connection per client. `subscribe` reduces chunks and controls in order and drops a sequence it already applied. A `superseded` control invalidates only that attempt. F29 through F31 are in `tests/sse.test.ts`. There is no retention or expiry.
+`stepCtx.emit` appends UTF-8 batches to `run_stream_events` on `POST /worker/v1/stream`. One unacknowledged buffer is in flight. It flushes at about 100 ms, at 4 KiB, and before completion or failure. Completion, failure, finish, and restart commit `step_completed`, `step_failed`, `run_terminal`, or `superseded` in the same transaction as the workflow transition. F23 through F28 are in `tests/stream.test.ts`. `GET /v1/runs/:id/stream` serves those rows as SSE. One shared `LISTEN` connection wakes readers; it is not a connection per client. `subscribe` reduces chunks and controls in order and drops a sequence it already applied. A `superseded` control invalidates only that attempt. F29 through F31 are in `tests/sse.test.ts`. A finished run's stream log expires seven days after completion. `relay_expire_streams` locks one due run, deletes its stream rows, and leaves `next_stream_seq` where it is. `GET /v1/runs/:id` still returns the output. A new batch is rejected and an identical operation receipt is replayed without allocating a sequence. F32 is `tests/retention.test.ts`. There is no timer, signal, dashboard, or metrics endpoint.
 
 ## Known issues
 
@@ -49,7 +50,7 @@ Phase 1 hooks for grant, heartbeat, declaration, and completion abort the open t
 
 ## Next milestone
 
-Seven-day retention, explicit inputs, timers, retries, and the failed-run view. Phase 2 is not complete.
+Explicit inputs, timers, retries, and the failed-run view. Phase 2 is not complete.
 
 ## Next task
 

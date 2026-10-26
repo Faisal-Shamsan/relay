@@ -18,6 +18,21 @@ export interface StreamView {
   runState: string | null;
 }
 
+export class StreamExpiredError extends Error {
+  readonly state: string | null;
+  readonly output: Json | null;
+  readonly failure: Json | null;
+
+  constructor(body: { [key: string]: Json | undefined }) {
+    super("stream history has expired");
+    this.name = "StreamExpired";
+    const details = isObject(body) && isObject(body.details) ? body.details : {};
+    this.state = typeof details.state === "string" ? details.state : null;
+    this.output = details.output === undefined ? null : details.output;
+    this.failure = details.error === undefined ? null : details.error;
+  }
+}
+
 export async function* subscribe(options: {
   serverUrl: string;
   runId: string;
@@ -27,6 +42,11 @@ export async function* subscribe(options: {
   const url = new URL(`${options.serverUrl}/v1/runs/${options.runId}/stream`);
   if (options.after !== undefined) url.searchParams.set("after", options.after);
   const response = await fetch(url, { signal: options.signal });
+  if (response.status === 410) {
+    const parsed = JSON.parse(await response.text()) as Json;
+    if (!isObject(parsed)) throw new Error("stream expired without a JSON body");
+    throw new StreamExpiredError(parsed);
+  }
   if (!response.ok || response.body === null) {
     throw new Error(`stream failed ${response.status}: ${await response.text()}`);
   }
@@ -43,6 +63,7 @@ export async function* subscribe(options: {
         const block = buffer.slice(0, split);
         buffer = buffer.slice(split + 2);
         const event = parseBlock(block);
+        if (event?.kind === "expired") throw new StreamExpiredError(event.data);
         if (event) yield event;
         split = buffer.indexOf("\n\n");
       }
@@ -99,10 +120,15 @@ function parseBlock(block: string): StreamEvent | null {
     else if (line.startsWith("event:")) kind = line.slice(6).trim();
     else if (line.startsWith("data:")) data.push(line.slice(5).trim());
   }
-  if (seq.length === 0 || kind.length === 0 || data.length === 0) return null;
+  if (kind.length === 0 || data.length === 0) return null;
+  if (kind !== "expired" && seq.length === 0) return null;
   const parsed = JSON.parse(data.join("\n")) as Json;
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
   return { seq, kind, data: parsed };
+}
+
+function isObject(value: unknown): value is { [key: string]: Json | undefined } {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function stringField(value: Json | undefined): string {

@@ -23,6 +23,7 @@ interface Subscriber {
   pending: string[];
   response: ServerResponse;
   wake: () => void;
+  onIdle: (() => void) | null;
 }
 
 export interface StreamHub {
@@ -76,15 +77,12 @@ export async function createStreamHub(options: {
     async serve(req, res, runId, url) {
       if (closed) throw new HttpError(404, "InvalidRunState", "run not found");
       const cursor = streamCursor(req, url);
-      const found = await options.pool.query<{ high: string }>(
-        `SELECT COALESCE((SELECT max(seq) FROM run_stream_events e WHERE e.run_id = r.id), 0)::text AS high
-         FROM runs r
-         WHERE r.id = $1 AND r.tenant_id = $2`,
-        [runId, SEEDED_TENANT_ID],
-      );
-      const high = found.rows[0]?.high;
-      if (high === undefined) throw new HttpError(404, "InvalidRunState", "run not found");
-      if (BigInt(cursor) > BigInt(high)) {
+      const opened = await loadSnapshot(options.pool, runId, cursor);
+      if (!opened.found) throw new HttpError(404, "InvalidRunState", "run not found");
+      if (opened.expired) {
+        throw new HttpError(410, "StreamExpired", "stream history has expired", expiredDetails(runId, opened));
+      }
+      if (BigInt(cursor) > BigInt(opened.high)) {
         throw new HttpError(409, "StreamCursor", "stream cursor is past the log");
       }
 
@@ -98,6 +96,7 @@ export async function createStreamHub(options: {
         pending: [],
         response: res,
         wake: () => wake(),
+        onIdle: null,
       };
       const group = listeners.get(runId) ?? new Set<Subscriber>();
       group.add(subscriber);
@@ -109,6 +108,8 @@ export async function createStreamHub(options: {
         if (subscriber.closed) return;
         clearInterval(keepalive);
         subscriber.closed = true;
+        subscriber.onIdle?.();
+        subscriber.onIdle = null;
         wake();
         remove(subscriber);
         stops.delete(stopSubscriber);
@@ -128,9 +129,23 @@ export async function createStreamHub(options: {
         await options.beforeCatchup?.(runId);
         while (!subscriber.closed) {
           subscriber.dirty = false;
-          const rows = await loadRows(options.pool, runId, subscriber.cursor);
+          const page = await loadSnapshot(options.pool, runId, subscriber.cursor);
           if (subscriber.closed) return;
-          for (const row of rows) {
+          if (page.expired) {
+            const notice = `event: expired\ndata: ${JSON.stringify({
+              code: "StreamExpired",
+              message: "stream history has expired",
+              details: expiredDetails(runId, page),
+            })}\n\n`;
+            await new Promise<void>((resolve) => {
+              subscriber.onIdle = resolve;
+              subscriber.pending.push(notice);
+              pump(subscriber, stopSubscriber);
+            });
+            if (!subscriber.closed && !res.writableEnded) res.end();
+            return;
+          }
+          for (const row of page.rows) {
             if (!enqueue(subscriber, frame(row), options.queueLimit, stopSubscriber)) return;
             subscriber.cursor = row.seq;
           }
@@ -168,16 +183,78 @@ function streamCursor(req: IncomingMessage, url: URL): string {
   return decimalString(selected, headerCursor === null ? "after" : "Last-Event-ID");
 }
 
-async function loadRows(pool: pg.Pool, runId: string, cursor: string): Promise<StreamRow[]> {
-  const result = await pool.query<StreamRow>(
-    `SELECT seq::text AS seq, kind, step_key AS "stepKey", attempt,
-            batch_seq::text AS "batchSeq", payload
-     FROM run_stream_events
-     WHERE run_id = $1 AND seq > $2::bigint
-     ORDER BY seq`,
-    [runId, cursor],
+interface Snapshot {
+  found: boolean;
+  expired: boolean;
+  state: string;
+  output: Json | null;
+  error: Json | null;
+  high: string;
+  rows: StreamRow[];
+}
+
+interface SnapshotRow {
+  expired: boolean;
+  state: string;
+  output: Json | null;
+  error: Json | null;
+  high: string;
+  seq: string | null;
+  kind: string | null;
+  stepKey: string | null;
+  attempt: number | null;
+  batchSeq: string | null;
+  payload: Json | null;
+}
+
+async function loadSnapshot(pool: pg.Pool, runId: string, cursor: string): Promise<Snapshot> {
+  const result = await pool.query<SnapshotRow>(
+    `SELECT (r.stream_expired_at IS NOT NULL) AS expired,
+            r.state,
+            r.output,
+            r.error,
+            COALESCE((SELECT max(seq) FROM run_stream_events m WHERE m.run_id = r.id), 0)::text AS high,
+            e.seq::text AS seq,
+            e.kind,
+            e.step_key AS "stepKey",
+            e.attempt,
+            e.batch_seq::text AS "batchSeq",
+            e.payload
+     FROM runs r
+     LEFT JOIN run_stream_events e
+       ON e.run_id = r.id
+      AND r.stream_expired_at IS NULL
+      AND e.seq > $3::bigint
+     WHERE r.id = $1 AND r.tenant_id = $2
+     ORDER BY e.seq`,
+    [runId, SEEDED_TENANT_ID, cursor],
   );
-  return result.rows;
+  const first = result.rows[0];
+  if (!first) return { found: false, expired: false, state: "", output: null, error: null, high: "0", rows: [] };
+  const rows = result.rows.flatMap((row) => {
+    if (row.seq === null || row.kind === null || row.payload === null) return [];
+    return [{
+      seq: row.seq,
+      kind: row.kind,
+      stepKey: row.stepKey,
+      attempt: row.attempt,
+      batchSeq: row.batchSeq,
+      payload: row.payload,
+    }];
+  });
+  return {
+    found: true,
+    expired: first.expired,
+    state: first.state,
+    output: first.output,
+    error: first.error,
+    high: first.high,
+    rows,
+  };
+}
+
+function expiredDetails(runId: string, page: Snapshot): Record<string, unknown> {
+  return { runId, state: page.state, output: page.output, error: page.error };
 }
 
 function frame(row: StreamRow): string {
@@ -210,7 +287,13 @@ function enqueue(subscriber: Subscriber, next: string, limit: number, stop: () =
 }
 
 function pump(subscriber: Subscriber, stop: () => void): void {
-  if (subscriber.closed || subscriber.inflight || subscriber.pending.length === 0) return;
+  if (subscriber.closed || subscriber.inflight) return;
+  if (subscriber.pending.length === 0) {
+    const idle = subscriber.onIdle;
+    subscriber.onIdle = null;
+    idle?.();
+    return;
+  }
   const next = subscriber.pending.shift();
   if (next === undefined) return;
   subscriber.inflight = true;

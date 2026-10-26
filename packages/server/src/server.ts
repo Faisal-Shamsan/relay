@@ -31,12 +31,22 @@ export async function startServer(options: {
   streamKeepaliveMs?: number;
   streamQueueLimit?: number;
   socketHighWaterMark?: number;
+  streamRetentionIntervalMs?: number;
+  streamRetentionHorizonMs?: number;
   beforeStreamCatchup?: (runId: string) => Promise<void>;
 }): Promise<StartedServer> {
   const leaseDurationMs = requirePositiveInteger(options.leaseDurationMs, "leaseDurationMs");
   const heartbeatIntervalMs = requirePositiveInteger(options.heartbeatIntervalMs ?? 10_000, "heartbeatIntervalMs");
   const reaperIntervalMs = requireNonNegativeInteger(options.reaperIntervalMs ?? 1_000, "reaperIntervalMs");
   const recoveryBudget = requireRecoveryBudget(options.recoveryBudget ?? 100);
+  const streamRetentionIntervalMs = requireNonNegativeInteger(
+    options.streamRetentionIntervalMs ?? 60_000,
+    "streamRetentionIntervalMs",
+  );
+  const streamRetentionHorizonMs = requireNonNegativeInteger(
+    options.streamRetentionHorizonMs ?? 7 * 24 * 60 * 60 * 1000,
+    "streamRetentionHorizonMs",
+  );
   if (options.socketHighWaterMark !== undefined) {
     requirePositiveInteger(options.socketHighWaterMark, "socketHighWaterMark");
   }
@@ -64,7 +74,7 @@ export async function startServer(options: {
         res.end(JSON.stringify({ code: "Internal", message: "internal error", details: {}, requestId }));
         return;
       }
-      sendJson(res, mapped.status, { code: mapped.code, message: mapped.message, details: {}, requestId });
+      sendJson(res, mapped.status, { code: mapped.code, message: mapped.message, details: mapped.details, requestId });
     }
   });
 
@@ -76,6 +86,7 @@ export async function startServer(options: {
     throw new Error("server did not bind a TCP port");
   }
   let reaper: NodeJS.Timeout | undefined;
+  let retention: NodeJS.Timeout | undefined;
   if (reaperIntervalMs > 0) {
     const tick = () => {
       void reapExpiredLeases(pool, 32).catch((error: unknown) => {
@@ -86,10 +97,20 @@ export async function startServer(options: {
     reaper = setInterval(tick, reaperIntervalMs);
     reaper.unref();
   }
+  if (streamRetentionIntervalMs > 0) {
+    const sweep = () => {
+      void expireDueStreams(pool, streamRetentionHorizonMs).catch((error: unknown) => {
+        console.error("stream retention failed", error);
+      });
+    };
+    retention = setInterval(sweep, streamRetentionIntervalMs);
+    retention.unref();
+  }
   return {
     url: `http://127.0.0.1:${address.port}`,
     close: async () => {
       if (reaper) clearInterval(reaper);
+      if (retention) clearInterval(retention);
       await stream.close();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
@@ -578,6 +599,17 @@ async function readBody(req: IncomingMessage): Promise<string> {
     chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+async function expireDueStreams(pool: ReturnType<typeof createPool>, horizonMs: number): Promise<void> {
+  for (let n = 0; n < 32; n += 1) {
+    const status = await callJson(
+      pool,
+      `SELECT relay_expire_streams($1::interval) AS result`,
+      [`${horizonMs} milliseconds`],
+    );
+    if (status !== "expired") return;
+  }
 }
 
 async function reapExpiredLeases(pool: ReturnType<typeof createPool>, limit: number): Promise<void> {
