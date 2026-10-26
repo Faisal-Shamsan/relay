@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import {
+  canonicalHash,
   logicalStepIdempotencyKey,
   PROTOCOL_VERSION,
   SEEDED_TENANT_ID,
@@ -14,6 +15,7 @@ import {
   type ParallelChild,
   type ParallelFailure,
   type StepContext,
+  type StepOptions,
   type WorkflowDefinition,
 } from "./workflow.js";
 
@@ -101,7 +103,14 @@ export async function runActivation(options: {
     control,
   });
 
-  const step = async (name: string, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json> => {
+  async function step(name: string, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json>;
+  async function step(name: string, options: StepOptions, fn: (stepCtx: StepContext, input: Json) => Promise<Json>): Promise<Json>;
+  async function step(
+    name: string,
+    fnOrOptions: ((stepCtx: StepContext) => Promise<Json>) | StepOptions,
+    maybeFn?: (stepCtx: StepContext, input: Json) => Promise<Json>,
+  ): Promise<Json> {
+    const resolved = resolveStepCall(fnOrOptions, maybeFn);
     if (inStep || inCallback > 0) {
       const error = new Error("nested step");
       error.name = "ConcurrentCommand";
@@ -113,14 +122,12 @@ export async function runActivation(options: {
       throw error;
     }
     const position = nextPos;
-    const expected = { kind: "step" as const, key: name, explicitInput: false };
+    const expected = resolved.explicit === null
+      ? { kind: "step" as const, key: name, explicitInput: false as const }
+      : { kind: "step" as const, key: name, explicitInput: true as const, inputHash: resolved.explicit.hash };
     const historical = commands[position];
     if (historical) {
-      if (
-        historical.descriptor.kind !== expected.kind ||
-        historical.descriptor.key !== expected.key ||
-        historical.descriptor.explicitInput !== expected.explicitInput
-      ) {
+      if (!sameStep(historical.descriptor, expected)) {
         throw nondeterminism(position, historical.descriptor, expected);
       }
       seen.add(name);
@@ -141,11 +148,19 @@ export async function runActivation(options: {
             kind: "restart_attempt",
             stepKey: name,
           }, options.completionRequestPath, control)
-        : await postIntent(options, sessionId, runId, fence, {
-            kind: "declare_and_start",
-            stepKey: name,
-            expectedCommandPos: String(position),
-          }, options.completionRequestPath, control);
+        : await postIntent(options, sessionId, runId, fence, resolved.explicit === null
+          ? {
+              kind: "declare_and_start",
+              stepKey: name,
+              expectedCommandPos: String(position),
+            }
+          : {
+              kind: "declare_and_start",
+              stepKey: name,
+              expectedCommandPos: String(position),
+              explicitInput: true,
+              input: resolved.explicit.input,
+            }, options.completionRequestPath, control);
       const attempt = Number(started.attempt);
       const attemptToken = String(started.attemptToken);
       if (historical) {
@@ -160,13 +175,14 @@ export async function runActivation(options: {
       let raw: Json | undefined;
       let failure: unknown;
       try {
-        raw = await fn({
+        const stepCtx = {
           idempotencyKey,
           attempt,
           attemptToken,
           signal: abort.signal,
-          emit: (text) => stream!.emit(text),
-        });
+          emit: (text: string) => stream!.emit(text),
+        };
+        raw = await resolved.fn(stepCtx, resolved.explicit === null ? null : resolved.explicit.frozen);
       } catch (error) {
         failure = error;
       } finally {
@@ -207,7 +223,7 @@ export async function runActivation(options: {
       stream?.stop();
       inStep = false;
     }
-  };
+  }
 
   const parallel = async (
     group: string,
@@ -226,11 +242,24 @@ export async function runActivation(options: {
     if (children.length > 1000) throw namedError("Serialization", "parallel group exceeds 1000 children");
     const names: string[] = [];
     const localNames = new Set<string>();
+    const childInputs: ChildFingerprint[] = [];
+    const explicitChildren = new Map<string, Json>();
     for (const child of children) {
       if (!validKey(child.name)) throw namedError("Serialization", "child step key is invalid");
       if (localNames.has(child.name) || seen.has(child.name)) throw namedError("DuplicateStepKey", "duplicate step key");
+      for (const key of Object.keys(child)) {
+        if (key !== "name" && key !== "input" && key !== "run") throw namedError("Serialization", "parallel child options are invalid");
+      }
       localNames.add(child.name);
       names.push(child.name);
+      if ("input" in child) {
+        const input = validateRelayJson(child.input);
+        const hash = canonicalHash(input);
+        childInputs.push({ explicitInput: true, inputHash: hash });
+        explicitChildren.set(child.name, freezeJson(input));
+      } else {
+        childInputs.push({ explicitInput: false });
+      }
     }
     const position = nextPos;
     const expected = {
@@ -239,6 +268,7 @@ export async function runActivation(options: {
       children: names,
       concurrency,
       explicitInput: false as const,
+      childInputs,
     };
     const historical = commands[position];
     if (historical && !sameParallel(historical.descriptor, expected)) {
@@ -250,13 +280,23 @@ export async function runActivation(options: {
       seenGroups.add(group);
       nextPos += 1;
       if (!historical) {
-        await postIntent(options, sessionId, runId, fence, {
+        const anyInput = childInputs.some((child) => child.explicitInput);
+        const declared: Json = {
           kind: "declare_parallel",
           groupKey: group,
           expectedCommandPos: String(position),
           children: names,
           concurrency,
-        }, options.completionRequestPath, control);
+        };
+        if (anyInput) {
+          const specs: Json[] = [];
+          for (const child of children) {
+            if ("input" in child) specs.push({ explicitInput: true, input: explicitChildren.get(child.name) ?? null });
+            else specs.push({ explicitInput: false });
+          }
+          declared.childInputs = specs;
+        }
+        await postIntent(options, sessionId, runId, fence, declared, options.completionRequestPath, control);
       }
       const outcomes = await settleParallel({
         children,
@@ -307,13 +347,16 @@ export async function runActivation(options: {
       try {
         let raw: Json;
         try {
-          raw = await child.run({
+          const stepCtx = {
             idempotencyKey: logicalStepIdempotencyKey(tenantId, runId, child.name),
             attempt,
             attemptToken,
             signal: abort.signal,
-            emit: (text) => stream.emit(text),
-          });
+            emit: (text: string) => stream.emit(text),
+          };
+          raw = explicitChildren.has(child.name)
+            ? await child.run(stepCtx, explicitChildren.get(child.name) as Json)
+            : await child.run(stepCtx);
         } catch (error) {
           if (error instanceof WorkerHttpError || control.lost) throw error;
           if (error instanceof Error && (error.name === "ConcurrentCommand" || error.name === "Nondeterminism" || error.name === "DuplicateStepKey" || error.name === "Serialization")) {
@@ -660,17 +703,74 @@ function storedFailure(error: Json | undefined): { code: "StepFailed"; message: 
   return { code: "StepFailed", message: "step failed" };
 }
 
+interface ChildFingerprint {
+  explicitInput: boolean;
+  inputHash?: string;
+}
+
+function sameStep(
+  descriptor: { [key: string]: Json },
+  expected: { kind: "step"; key: string; explicitInput: boolean; inputHash?: string },
+): boolean {
+  if (descriptor.kind !== expected.kind || descriptor.key !== expected.key) return false;
+  const recorded = descriptor.explicitInput === true;
+  if (recorded !== expected.explicitInput) return false;
+  if (!expected.explicitInput) return true;
+  return descriptor.inputHash === expected.inputHash;
+}
+
 function sameParallel(
   descriptor: { [key: string]: Json },
-  expected: { kind: "parallel"; key: string; children: string[]; concurrency: number; explicitInput: false },
+  expected: { kind: "parallel"; key: string; children: string[]; concurrency: number; explicitInput: false; childInputs: ChildFingerprint[] },
 ): boolean {
-  return descriptor.kind === expected.kind
+  const shape = descriptor.kind === expected.kind
     && descriptor.key === expected.key
     && descriptor.explicitInput === expected.explicitInput
     && descriptor.concurrency === expected.concurrency
     && Array.isArray(descriptor.children)
     && descriptor.children.length === expected.children.length
     && descriptor.children.every((child, index) => child === expected.children[index]);
+  if (!shape) return false;
+  const any = expected.childInputs.some((child) => child.explicitInput);
+  const recorded = descriptor.childInputs;
+  if (!any) return recorded === undefined;
+  if (!Array.isArray(recorded) || recorded.length !== expected.childInputs.length) return false;
+  return expected.childInputs.every((child, index) => {
+    const row = recorded[index];
+    if (typeof row !== "object" || row === null || Array.isArray(row)) return false;
+    if (row.explicitInput !== child.explicitInput) return false;
+    if (!child.explicitInput) return row.inputHash === undefined;
+    return row.inputHash === child.inputHash;
+  });
+}
+
+function resolveStepCall(
+  fnOrOptions: ((stepCtx: StepContext) => Promise<Json>) | StepOptions,
+  maybeFn: ((stepCtx: StepContext, input: Json) => Promise<Json>) | undefined,
+): { fn: (stepCtx: StepContext, input: Json) => Promise<Json>; explicit: { input: Json; hash: string; frozen: Json } | null } {
+  if (typeof fnOrOptions === "function") {
+    if (maybeFn !== undefined) throw namedError("Serialization", "step options are invalid");
+    return { fn: (stepCtx) => fnOrOptions(stepCtx), explicit: null };
+  }
+  if (typeof maybeFn !== "function" || !isPlainObject(fnOrOptions) || !("input" in fnOrOptions) || Object.keys(fnOrOptions).length !== 1) {
+    throw namedError("Serialization", "step options are invalid");
+  }
+  const input = validateRelayJson(fnOrOptions.input);
+  return { fn: maybeFn, explicit: { input, hash: canonicalHash(input), frozen: freezeJson(input) } };
+}
+
+function freezeJson(value: Json): Json {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    for (const item of value) freezeJson(item);
+    return Object.freeze(value) as Json;
+  }
+  for (const key of Object.keys(value)) freezeJson(value[key] as Json);
+  return Object.freeze(value) as Json;
+}
+
+function isPlainObject(value: object): value is { [key: string]: Json | undefined } {
+  return !Array.isArray(value);
 }
 
 function validKey(value: string): boolean {
@@ -683,9 +783,14 @@ function namedError(name: string, message: string): Error {
   return error;
 }
 
-function nondeterminism(position: number, expected: Json, actual: Json | null, reason = "command descriptor mismatch"): Error {
+function nondeterminism(position: number, expected: unknown, actual: unknown, reason = "command descriptor mismatch"): Error {
   const error = new Error(reason) as Error & { details: Json };
   error.name = "Nondeterminism";
-  error.details = { position: String(position), expected, actual, reason };
+  error.details = {
+    position: String(position),
+    expected: expected as Json,
+    actual: actual as Json,
+    reason,
+  };
   return error;
 }

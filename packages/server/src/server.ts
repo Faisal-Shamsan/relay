@@ -5,6 +5,7 @@ import {
   canonicalRelayJson,
   HTTP_BODY_LIMIT,
   parseRelayJson,
+  validateRelayJson,
   PROTOCOL_VERSION,
   RelayJsonError,
   SEEDED_TENANT_ID,
@@ -441,25 +442,40 @@ async function dispatchIntent(
   if (kind === "declare_and_start") {
     const stepKey = requiredString(intent, "stepKey");
     const expected = decimalString(intent.expectedCommandPos, "expectedCommandPos");
+    const explicit = explicitInput(intent);
     return callJson(
       pool,
-      `WITH cfg AS (SELECT set_config('relay.recovery_budget', $8, true))
-       SELECT relay_declare_and_start($1,$2,$3,$4::bigint,$5,$6::bigint,$7) AS result FROM cfg`,
-      [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, stepKey, expected, ctx.hash, String(ctx.recoveryBudget)],
+      `WITH cfg AS (SELECT set_config('relay.recovery_budget', $11, true))
+       SELECT relay_declare_and_start($1,$2,$3,$4::bigint,$5,$6::bigint,$7,$8,$9::jsonb,$10) AS result FROM cfg`,
+      [
+        ctx.operationId,
+        ctx.sessionId,
+        ctx.runId,
+        ctx.fence,
+        stepKey,
+        expected,
+        ctx.hash,
+        explicit.present,
+        explicit.present ? JSON.stringify(explicit.input) : null,
+        explicit.hash,
+        String(ctx.recoveryBudget),
+      ],
     );
   }
   if (kind === "declare_parallel") {
-    const children = intent.children;
-    if (!Array.isArray(children) || children.some((child) => typeof child !== "string")) {
+    const rawChildren = intent.children;
+    if (!Array.isArray(rawChildren) || rawChildren.some((child) => typeof child !== "string")) {
       throw new HttpError(422, "Serialization", "children must be an array of strings");
     }
+    const children = rawChildren as string[];
     if (typeof intent.concurrency !== "number" || !Number.isInteger(intent.concurrency)) {
       throw new HttpError(422, "Serialization", "concurrency must be an integer");
     }
+    const childInputs = childInputFingerprints(children, intent.childInputs);
     return callJson(
       pool,
-      `WITH cfg AS (SELECT set_config('relay.recovery_budget', $10, true))
-       SELECT relay_declare_parallel($1,$2,$3,$4::bigint,$5,$6::bigint,$7::jsonb,$8,$9) AS result FROM cfg`,
+      `WITH cfg AS (SELECT set_config('relay.recovery_budget', $11, true))
+       SELECT relay_declare_parallel($1,$2,$3,$4::bigint,$5,$6::bigint,$7::jsonb,$8,$9,$10::jsonb) AS result FROM cfg`,
       [
         ctx.operationId,
         ctx.sessionId,
@@ -470,6 +486,7 @@ async function dispatchIntent(
         JSON.stringify(children),
         intent.concurrency,
         ctx.hash,
+        childInputs === null ? null : JSON.stringify(childInputs),
         String(ctx.recoveryBudget),
       ],
     );
@@ -561,6 +578,47 @@ function requireProtocol(body: Json): void {
   if (body.protocolVersion !== PROTOCOL_VERSION) {
     throw new HttpError(422, "UnsupportedCapability", "protocol version is not supported");
   }
+}
+
+function explicitInput(intent: { [key: string]: Json | undefined }): { present: boolean; input: Json; hash: string | null } {
+  if (intent.explicitInput === undefined || intent.explicitInput === false) {
+    if ("input" in intent) throw new HttpError(422, "Serialization", "input requires an explicit input");
+    return { present: false, input: null, hash: null };
+  }
+  if (intent.explicitInput !== true) throw new HttpError(422, "Serialization", "explicitInput must be boolean");
+  if (!("input" in intent)) throw new HttpError(422, "Serialization", "explicit input is missing");
+  const input = validateRelayJson(intent.input ?? null);
+  return { present: true, input, hash: canonicalHash(input) };
+}
+
+function childInputFingerprints(children: string[], raw: Json | undefined): Json[] | null {
+  if (raw === undefined) return null;
+  if (!Array.isArray(raw) || raw.length !== children.length) {
+    throw new HttpError(422, "Serialization", "child inputs must align with children");
+  }
+  let any = false;
+  const specs: Json[] = [];
+  for (const item of raw) {
+    if (!isJsonObject(item) || typeof item.explicitInput !== "boolean") {
+      throw new HttpError(422, "Serialization", "child input is invalid");
+    }
+    if (!item.explicitInput) {
+      if ("input" in item || "inputHash" in item) {
+        throw new HttpError(422, "Serialization", "input requires an explicit input");
+      }
+      specs.push({ explicitInput: false });
+      continue;
+    }
+    if (!("input" in item)) throw new HttpError(422, "Serialization", "explicit input is missing");
+    any = true;
+    const input = validateRelayJson(item.input ?? null);
+    specs.push({ explicitInput: true, input, inputHash: canonicalHash(input) });
+  }
+  return any ? specs : null;
+}
+
+function isJsonObject(value: Json | undefined): value is { [key: string]: Json } {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function requiredString(body: object, field: string): string {

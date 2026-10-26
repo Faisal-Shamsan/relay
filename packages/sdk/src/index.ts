@@ -5,6 +5,7 @@ export {
   type ParallelChild,
   type ParallelFailure,
   type StepContext,
+  type StepOptions,
   type WorkflowContext,
   type WorkflowDefinition,
 } from "./workflow.js";
