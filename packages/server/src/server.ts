@@ -12,10 +12,12 @@ import {
 } from "@relay/protocol";
 import { callJson, createPool, withTransaction } from "./db.js";
 import { decimalString, fromDatabaseError, HttpError } from "./errors.js";
+import { createStreamHub, type StreamHub } from "./stream-hub.js";
 
 export interface StartedServer {
   url: string;
   close: () => Promise<void>;
+  suppressStreamNotifications(): void;
 }
 
 export async function startServer(options: {
@@ -25,16 +27,34 @@ export async function startServer(options: {
   reaperIntervalMs?: number;
   recoveryBudget?: number;
   port?: number;
+  streamPollMs?: number;
+  streamKeepaliveMs?: number;
+  streamQueueLimit?: number;
+  socketHighWaterMark?: number;
+  beforeStreamCatchup?: (runId: string) => Promise<void>;
 }): Promise<StartedServer> {
   const leaseDurationMs = requirePositiveInteger(options.leaseDurationMs, "leaseDurationMs");
   const heartbeatIntervalMs = requirePositiveInteger(options.heartbeatIntervalMs ?? 10_000, "heartbeatIntervalMs");
   const reaperIntervalMs = requireNonNegativeInteger(options.reaperIntervalMs ?? 1_000, "reaperIntervalMs");
   const recoveryBudget = requireRecoveryBudget(options.recoveryBudget ?? 100);
+  if (options.socketHighWaterMark !== undefined) {
+    requirePositiveInteger(options.socketHighWaterMark, "socketHighWaterMark");
+  }
   const pool = createPool(options.appDatabaseUrl);
-  const server = createServer(async (req, res) => {
+  const stream = await createStreamHub({
+    appDatabaseUrl: options.appDatabaseUrl,
+    pool,
+    pollMs: requirePositiveInteger(options.streamPollMs ?? 1_000, "streamPollMs"),
+    keepaliveMs: requirePositiveInteger(options.streamKeepaliveMs ?? 15_000, "streamKeepaliveMs"),
+    queueLimit: requirePositiveInteger(options.streamQueueLimit ?? 32, "streamQueueLimit"),
+    beforeCatchup: options.beforeStreamCatchup,
+  });
+  const server = createServer(
+    options.socketHighWaterMark === undefined ? {} : { highWaterMark: options.socketHighWaterMark },
+    async (req, res) => {
     const requestId = randomUUID();
     try {
-      await route(pool, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId);
+      await route(pool, stream, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId);
     } catch (error) {
       const mapped = error instanceof HttpError ? error : error instanceof RelayJsonError
         ? new HttpError(422, "Serialization", error.message)
@@ -70,16 +90,19 @@ export async function startServer(options: {
     url: `http://127.0.0.1:${address.port}`,
     close: async () => {
       if (reaper) clearInterval(reaper);
+      await stream.close();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
       await pool.end();
     },
+    suppressStreamNotifications: () => stream.suppressNotifications(),
   };
 }
 
 async function route(
   pool: ReturnType<typeof createPool>,
+  stream: StreamHub,
   leaseDurationMs: number,
   heartbeatIntervalMs: number,
   recoveryBudget: number,
@@ -209,6 +232,14 @@ async function route(
     const more = page.length > limit;
     const events = more ? page.slice(0, limit) : page;
     sendJson(res, 200, { events, next: more ? events[events.length - 1]?.seq ?? null : null });
+    return;
+  }
+
+  const streamMatch = /^\/v1\/runs\/([0-9a-fA-F-]{36})\/stream$/.exec(url.pathname);
+  if (req.method === "GET" && streamMatch) {
+    const runId = streamMatch[1];
+    if (runId === undefined) throw new HttpError(404, "InvalidRunState", "run not found");
+    await stream.serve(req, res, runId, url);
     return;
   }
 

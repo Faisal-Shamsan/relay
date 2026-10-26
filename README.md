@@ -89,7 +89,7 @@ The command compares commands, steps, attempts, and the business fields of the r
 - Phase 1 does not retry a callback that threw. Crash recovery stops at the recovery budget stored on the step. The default is 100.
 - Workers advertise an exact workflow version. A run pinned to v1 stays pending while only a v2 worker is alive.
 - Replay compares command shape. A changed captured value with the same command shape is not detected.
-- A worker can append a durable stream batch. There is no client stream endpoint, timer, signal, dashboard, or metrics endpoint.
+- A worker can append a durable stream batch, and a client can resume that log over SSE. There is no stream expiry, timer, signal, dashboard, or metrics endpoint.
 - JSON follows the rules in `packages/protocol/src/json.ts`: the root counts as depth 1, unsafe integers are rejected, the receipt digest is SHA-256, and strings are not Unicode-normalized.
 - Invalid JSON is rejected with a path. It is not rewritten into a stored success.
 

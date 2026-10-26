@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 1 complete. Phase 2 is in progress: the M8 stream log is implemented. SSE, retention, helpers, timers, and retries are not.
+Phase 1 complete. Phase 2 is in progress: the stream log and live SSE are implemented. Retention, helpers, timers, and retries are not.
 
 ## Completed
 
@@ -17,6 +17,7 @@ Phase 1 complete. Phase 2 is in progress: the M8 stream log is implemented. SSE,
 - M6: an identical trigger returns the same run, and a different intent conflicts. A pinned v1 run stays pending when only a v2 worker is live. Direct invalid writes do not persist. Exceeding the stored recovery budget fails the run instead of starting another attempt.
 - M7: the remaining Phase 1 failpoint hooks roll back with the transaction. Projection verification reports drift without rewriting history. Run and event reads are available. A dropped database connection is resolved from the receipt, and the failover recovery point is disclosed. The failure demo completes 100 runs.
 - M8: a durable per-run stream log. A retried batch keeps one sequence. A conflicting or gapped batch writes nothing. Completion requires the flushed batch number. A crash after that flush supersedes only the interrupted attempt, and a crash after completion does not start another. A sibling's chunks stay in place.
+- M9: live SSE on the stream sequence. A shared listener only wakes readers. A client that reconnects across supersession matches one that stayed connected. A missed notification is recovered by catch-up or polling. A client that falls behind a bounded queue is disconnected, and a later batch still commits.
 
 ## In progress
 
@@ -38,7 +39,7 @@ Trigger identity is the tenant plus the idempotency key. F17 is `packages/server
 
 Phase 1 hooks for grant, heartbeat, declaration, and completion abort the open transaction through the existing failpoint helper. The server still does not expose a failpoint route. `lease.after-commit-before-response` is in the SDK, after the lease response. `GET /v1/runs/:id` and paginated event reads are on the HTTP server. `relay_verify_projections` compares commands, steps, attempts, business run fields, and the stream log with history. It does not repair them. F22 is `packages/server/test/failover.test.ts`; the recovery-point disclosure is in `README.md`. The 100-run demo is `tests/demo.test.ts`. It prints measured activation times and separates callback counts from provider effects. Invalid JSON is rejected with a path in `packages/protocol/test/json.test.ts`.
 
-`stepCtx.emit` appends UTF-8 batches to `run_stream_events` on `POST /worker/v1/stream`. One unacknowledged buffer is in flight. It flushes at about 100 ms, at 4 KiB, and before completion or failure. Completion, failure, finish, and restart commit `step_completed`, `step_failed`, `run_terminal`, or `superseded` in the same transaction as the workflow transition. F23 through F28 are in `tests/stream.test.ts`. There is no SSE or retention endpoint.
+`stepCtx.emit` appends UTF-8 batches to `run_stream_events` on `POST /worker/v1/stream`. One unacknowledged buffer is in flight. It flushes at about 100 ms, at 4 KiB, and before completion or failure. Completion, failure, finish, and restart commit `step_completed`, `step_failed`, `run_terminal`, or `superseded` in the same transaction as the workflow transition. F23 through F28 are in `tests/stream.test.ts`. `GET /v1/runs/:id/stream` serves those rows as SSE. One shared `LISTEN` connection wakes readers; it is not a connection per client. `subscribe` reduces chunks and controls in order and drops a sequence it already applied. A `superseded` control invalidates only that attempt. F29 through F31 are in `tests/sse.test.ts`. There is no retention or expiry.
 
 ## Known issues
 
@@ -48,7 +49,7 @@ Phase 1 hooks for grant, heartbeat, declaration, and completion abort the open t
 
 ## Next milestone
 
-SSE, seven-day retention, explicit inputs, timers, retries, and the failed-run view. Phase 2 is not complete.
+Seven-day retention, explicit inputs, timers, retries, and the failed-run view. Phase 2 is not complete.
 
 ## Next task
 
