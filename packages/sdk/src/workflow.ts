@@ -46,6 +46,9 @@ export interface WorkflowContext {
       options?: { concurrency?: number },
     ): Promise<Json[]>;
   };
+  now(key: string): Promise<string>;
+  random(key: string): Promise<number>;
+  uuid(key: string): Promise<string>;
 }
 
 export interface WorkflowDefinition {

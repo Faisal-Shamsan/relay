@@ -20,6 +20,12 @@ export type WorkerIntent =
       childInputs?: Array<{ explicitInput: boolean; input?: Json }>;
     }
   | {
+      kind: "record_helper";
+      helperKind: "now" | "random" | "uuid";
+      key: string;
+      expectedCommandPos: string;
+    }
+  | {
       kind: "start_attempt";
       stepKey: string;
     }

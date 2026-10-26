@@ -19,7 +19,7 @@ test("phase 1 failpoint hooks roll back the open transaction", async () => {
        FROM pg_proc p
        JOIN pg_namespace n ON n.oid = p.pronamespace
        WHERE n.nspname = 'public'
-         AND p.proname IN ('relay_grant_lease', 'relay_heartbeat', 'relay_declare_and_start', 'relay_declare_parallel', 'relay_complete_step')`,
+         AND p.proname IN ('relay_grant_lease', 'relay_heartbeat', 'relay_declare_and_start', 'relay_declare_parallel', 'relay_complete_step', 'relay_record_helper')`,
     );
     const byName = new Map(sources.rows.map((row) => [row.name, row.src]));
     assert.equal(byName.get("relay_grant_lease")?.includes("lease.after-lock-before-validation"), true);
@@ -28,6 +28,7 @@ test("phase 1 failpoint hooks roll back the open transaction", async () => {
     assert.equal(byName.get("relay_declare_and_start")?.includes("command.after-declaration-before-commit"), true);
     assert.equal(byName.get("relay_declare_parallel")?.includes("command.after-declaration-before-commit"), true);
     assert.equal(byName.get("relay_complete_step")?.includes("step.before-completion-commit"), true);
+    assert.equal(byName.get("relay_record_helper")?.includes("command.after-declaration-before-commit"), true);
 
     const sessionId = randomUUID();
     await app.query(`SELECT relay_register_worker($1,$2,$3,$4,1,$5::jsonb)`, [
@@ -76,6 +77,15 @@ test("phase 1 failpoint hooks roll back the open transaction", async () => {
       `SELECT relay_declare_and_start($1,$2,$3,$4::bigint,'only',0,$5) AS result`,
       [randomUUID(), sessionId, runId, fence, HASH],
     );
+    await expectAbort(app, "command.after-declaration-before-commit", true, () => app.query(
+      `SELECT relay_record_helper($1,$2,$3,$4::bigint,'now','report-time',1,$5)`,
+      [randomUUID(), sessionId, runId, fence, HASH],
+    ));
+    const afterHelperAbort = await admin.query<{ commands: string }>(
+      `SELECT count(*)::text AS commands FROM commands WHERE run_id = $1`,
+      [runId],
+    );
+    assert.equal(afterHelperAbort.rows[0]?.commands, "1");
     await expectAbort(app, "step.before-completion-commit", true, () => app.query(
       `SELECT relay_complete_step($1,$2,$3,$4::bigint,'only',1,$5,$6::jsonb,$7)`,
       [randomUUID(), sessionId, runId, fence, started.rows[0]!.result.attemptToken, JSON.stringify({ ok: true }), HASH],
