@@ -1,5 +1,7 @@
 # Relay
 
+Status: early development. APIs will change. Not for production use.
+
 Relay is a self-hostable TypeScript durable-execution engine. [docs/spec.md](docs/spec.md) is authoritative. [PROJECT.md](PROJECT.md) says what the project is for. This file is how to run the Phase 1 server.
 
 Phase 1 stores workflow history in one Postgres database and recovers a crashed worker from that history. It does not claim exactly-once side effects.
@@ -98,3 +100,7 @@ The command compares commands, steps, attempts, and the business fields of the r
 Relay uses one Postgres primary. A response means that transaction committed. With Postgres `synchronous_commit` left at its default, `on`, that commit is durable on the primary. Relay does not ship a replica. If you add an async replica, its lag is your recovery point, and Relay does not measure that lag.
 
 A crash can lose a transaction that had not committed. If a request ends without a response, do not assume it rolled back and do not send a new operation id. Read the receipt or `GET /v1/runs/<id>/events`. The same operation id returns the stored result when the commit won, and performs the transition when it did not.
+
+## License
+
+Licensed under the Apache License 2.0. See LICENSE.
