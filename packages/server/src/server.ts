@@ -26,6 +26,7 @@ export async function startServer(options: {
   leaseDurationMs: number;
   heartbeatIntervalMs?: number;
   reaperIntervalMs?: number;
+  timerIntervalMs?: number;
   recoveryBudget?: number;
   port?: number;
   streamPollMs?: number;
@@ -39,6 +40,7 @@ export async function startServer(options: {
   const leaseDurationMs = requirePositiveInteger(options.leaseDurationMs, "leaseDurationMs");
   const heartbeatIntervalMs = requirePositiveInteger(options.heartbeatIntervalMs ?? 10_000, "heartbeatIntervalMs");
   const reaperIntervalMs = requireNonNegativeInteger(options.reaperIntervalMs ?? 1_000, "reaperIntervalMs");
+  const timerIntervalMs = requireNonNegativeInteger(options.timerIntervalMs ?? 1_000, "timerIntervalMs");
   const recoveryBudget = requireRecoveryBudget(options.recoveryBudget ?? 100);
   const streamRetentionIntervalMs = requireNonNegativeInteger(
     options.streamRetentionIntervalMs ?? 60_000,
@@ -87,6 +89,7 @@ export async function startServer(options: {
     throw new Error("server did not bind a TCP port");
   }
   let reaper: NodeJS.Timeout | undefined;
+  let timers: NodeJS.Timeout | undefined;
   let retention: NodeJS.Timeout | undefined;
   if (reaperIntervalMs > 0) {
     const tick = () => {
@@ -97,6 +100,15 @@ export async function startServer(options: {
     tick();
     reaper = setInterval(tick, reaperIntervalMs);
     reaper.unref();
+  }
+  if (timerIntervalMs > 0) {
+    const tick = () => {
+      void fireDueTimers(pool, 32).catch((error: unknown) => {
+        console.error("timer sweep failed", error);
+      });
+    };
+    timers = setInterval(tick, timerIntervalMs);
+    timers.unref();
   }
   if (streamRetentionIntervalMs > 0) {
     const sweep = () => {
@@ -111,6 +123,7 @@ export async function startServer(options: {
     url: `http://127.0.0.1:${address.port}`,
     close: async () => {
       if (reaper) clearInterval(reaper);
+      if (timers) clearInterval(timers);
       if (retention) clearInterval(retention);
       await stream.close();
       await new Promise<void>((resolve, reject) => {
@@ -511,6 +524,25 @@ async function dispatchIntent(
       ],
     );
   }
+  if (kind === "schedule_timer") {
+    if (typeof intent.durationMs !== "number" || !Number.isSafeInteger(intent.durationMs) || intent.durationMs < 0) {
+      throw new HttpError(422, "Serialization", "durationMs must be a nonnegative safe integer");
+    }
+    return callJson(
+      pool,
+      `SELECT relay_schedule_timer($1,$2,$3,$4::bigint,$5,$6::bigint,$7::bigint,$8) AS result`,
+      [
+        ctx.operationId,
+        ctx.sessionId,
+        ctx.runId,
+        ctx.fence,
+        requiredString(intent, "key"),
+        String(intent.durationMs),
+        decimalString(intent.expectedCommandPos, "expectedCommandPos"),
+        ctx.hash,
+      ],
+    );
+  }
   if (kind === "start_attempt") {
     return callJson(
       pool,
@@ -687,6 +719,13 @@ async function expireDueStreams(pool: ReturnType<typeof createPool>, horizonMs: 
       [`${horizonMs} milliseconds`],
     );
     if (status !== "expired") return;
+  }
+}
+
+async function fireDueTimers(pool: ReturnType<typeof createPool>, limit: number): Promise<void> {
+  for (let n = 0; n < limit; n += 1) {
+    const status = await callJson(pool, `SELECT relay_fire_one_timer() AS result`, []);
+    if (status !== "fired") return;
   }
 }
 
