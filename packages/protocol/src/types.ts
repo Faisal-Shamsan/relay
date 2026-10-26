@@ -26,6 +26,12 @@ export type WorkerIntent =
       expectedCommandPos: string;
     }
   | {
+      kind: "schedule_timer";
+      key: string;
+      durationMs: number;
+      expectedCommandPos: string;
+    }
+  | {
       kind: "start_attempt";
       stepKey: string;
     }

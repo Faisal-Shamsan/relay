@@ -91,7 +91,7 @@ The command compares commands, steps, attempts, and the business fields of the r
 - Phase 1 does not retry a callback that threw. Crash recovery stops at the recovery budget stored on the step. The default is 100.
 - Workers advertise an exact workflow version. A run pinned to v1 stays pending while only a v2 worker is alive.
 - Replay compares command shape. An explicit step input is fingerprinted, and a change is rejected before the stored result is returned. A changed captured value with the same command shape is not detected. `ctx.now`, `ctx.random`, and `ctx.uuid` record one server-generated value. Replay returns that value, and a different key at that position is rejected.
-- A worker can append a durable stream batch, and a client can resume that log over SSE. A finished run's stream log expires seven days after completion. The run result remains, and a later read returns 410. There is no timer, retry policy, signal, dashboard, or metrics endpoint.
+- A worker can append a durable stream batch, and a client can resume that log over SSE. A finished run's stream log expires seven days after completion. The run result remains, and a later read returns 410. `ctx.sleep` records one database deadline and releases the worker until that deadline fires. There is no retry policy, signal, dashboard, or metrics endpoint.
 - JSON follows the rules in `packages/protocol/src/json.ts`: the root counts as depth 1, unsafe integers are rejected, the receipt digest is SHA-256, and strings are not Unicode-normalized.
 - Invalid JSON is rejected with a path. It is not rewritten into a stored success.
 

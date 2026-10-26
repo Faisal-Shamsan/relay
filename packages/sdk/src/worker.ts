@@ -89,7 +89,7 @@ export async function runActivation(options: {
   let inStep = false;
   let inCallback = 0;
   const abort = new AbortController();
-  const control = { lost: false };
+  const control = { lost: false, suspended: false };
   const beats = startHeartbeats({
     serverUrl: options.serverUrl,
     sessionId,
@@ -112,6 +112,7 @@ export async function runActivation(options: {
     maybeFn?: (stepCtx: StepContext, input: Json) => Promise<Json>,
   ): Promise<Json> {
     const resolved = resolveStepCall(fnOrOptions, maybeFn);
+    if (control.suspended) throw namedError("Suspended", "timer suspended the run");
     if (inStep || inCallback > 0) {
       const error = new Error("nested step");
       error.name = "ConcurrentCommand";
@@ -231,6 +232,7 @@ export async function runActivation(options: {
     children: readonly ParallelChild[],
     optionsParallel?: { concurrency?: number },
   ): Promise<Json[]> => {
+    if (control.suspended) throw namedError("Suspended", "timer suspended the run");
     if (inStep || inCallback > 0) {
       throw namedError("ConcurrentCommand", "nested command");
     }
@@ -400,6 +402,7 @@ export async function runActivation(options: {
   async function recordHelper(kind: "now" | "uuid", key: string): Promise<string>;
   async function recordHelper(kind: "random", key: string): Promise<number>;
   async function recordHelper(kind: "now" | "random" | "uuid", key: string): Promise<string | number> {
+    if (control.suspended) throw namedError("Suspended", "timer suspended the run");
     if (inStep || inCallback > 0) throw namedError("ConcurrentCommand", "nested command");
     if (!validKey(key)) throw namedError("Serialization", "helper key is invalid");
     const identity = `${kind}:${key}`;
@@ -427,14 +430,51 @@ export async function runActivation(options: {
     }
   }
 
+  async function sleep(key: string, durationMs: number): Promise<void> {
+    if (control.suspended) throw namedError("Suspended", "timer suspended the run");
+    if (inStep || inCallback > 0) throw namedError("ConcurrentCommand", "nested command");
+    if (!validKey(key)) throw namedError("Serialization", "timer key is invalid");
+    if (!Number.isSafeInteger(durationMs) || durationMs < 0) {
+      throw namedError("Serialization", "durationMs must be a nonnegative safe integer");
+    }
+    const identity = `sleep:${key}`;
+    if (seenHelpers.has(identity)) throw namedError("DuplicateStepKey", "duplicate timer key");
+    const position = nextPos;
+    const expected = { kind: "sleep" as const, key, durationMs };
+    const historical = commands[position];
+    if (historical && !sameSleep(historical.descriptor, expected)) {
+      throw nondeterminism(position, historical.descriptor, expected);
+    }
+    seenHelpers.add(identity);
+    nextPos += 1;
+    if (historical?.completed) return;
+    inStep = true;
+    try {
+      const recorded = await postIntent(options, sessionId, runId, fence, {
+        kind: "schedule_timer",
+        key,
+        durationMs,
+        expectedCommandPos: String(position),
+      }, options.completionRequestPath, control);
+      if (recorded.suspended === true) {
+        control.suspended = true;
+        throw namedError("Suspended", "timer suspended the run");
+      }
+    } finally {
+      inStep = false;
+    }
+  }
+
   try {
     const output = await options.workflow.fn({
       step: Object.assign(step, { parallel }),
       now: (key) => recordHelper("now", key),
       random: (key) => recordHelper("random", key),
       uuid: (key) => recordHelper("uuid", key),
+      sleep,
     }, input);
     beats.stop();
+    if (control.suspended) throw namedError("Suspended", "timer suspended the run");
     if (control.lost) throw new Error("lease lost");
     if (nextPos < commands.length) {
       const pending = commands[nextPos];
@@ -638,6 +678,13 @@ function indexCommands(events: HistoryEvent[]): CommandHistory[] {
         result: helper && recorded ? event.payload.outcome : undefined,
       };
     }
+    if (event.type === "TimerFired" && event.commandPos !== null) {
+      const command = commands[Number(event.commandPos)];
+      if (command) {
+        command.completed = true;
+        command.result = event.payload.wakeAt;
+      }
+    }
     if (event.type === "StepCompleted" && event.stepKey) {
       const command = commands.find((item) => item?.descriptor.kind === "step" && item.descriptor.key === event.stepKey);
       if (command) {
@@ -748,6 +795,15 @@ function storedFailure(error: Json | undefined): { code: "StepFailed"; message: 
 interface ChildFingerprint {
   explicitInput: boolean;
   inputHash?: string;
+}
+
+function sameSleep(
+  descriptor: { [key: string]: Json },
+  expected: { kind: "sleep"; key: string; durationMs: number },
+): boolean {
+  return descriptor.kind === expected.kind
+    && descriptor.key === expected.key
+    && descriptor.durationMs === expected.durationMs;
 }
 
 function sameHelper(

@@ -49,6 +49,7 @@ export interface WorkflowContext {
   now(key: string): Promise<string>;
   random(key: string): Promise<number>;
   uuid(key: string): Promise<string>;
+  sleep(key: string, durationMs: number): Promise<void>;
 }
 
 export interface WorkflowDefinition {
