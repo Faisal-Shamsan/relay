@@ -7,6 +7,7 @@ import {
   validateRelayJson,
   type Json,
 } from "@relay/protocol";
+import { createAttemptEmit, type AttemptEmit } from "./emit.js";
 import { hitFailpoint, loadFailpointPlan, type FailpointArm } from "./failpoints.js";
 import {
   ParallelStepError,
@@ -133,6 +134,7 @@ export async function runActivation(options: {
     }
 
     inStep = true;
+    let stream: AttemptEmit | undefined;
     try {
       const started = historical
         ? await postIntent(options, sessionId, runId, fence, {
@@ -146,24 +148,42 @@ export async function runActivation(options: {
           }, options.completionRequestPath, control);
       const attempt = Number(started.attempt);
       const attemptToken = String(started.attemptToken);
+      if (historical) {
+        await hitFailpoint(points, "stream.after-supersession-commit-before-new-chunk", { runId, stepKey: name, attempt }, options.barrierDir);
+      }
       const idempotencyKey = logicalStepIdempotencyKey(tenantId, runId, name);
+      stream = createAttemptEmit((text, batchSeq) => sendStreamBatch(
+        options, control, points, sessionId, runId, fence, name, attempt, attemptToken, text, batchSeq,
+      ));
       await hitFailpoint(points, "step.after-start-commit-before-callback", { runId, stepKey: name, attempt }, options.barrierDir);
       inCallback += 1;
-      let raw: Json;
+      let raw: Json | undefined;
+      let failure: unknown;
       try {
         raw = await fn({
           idempotencyKey,
           attempt,
           attemptToken,
           signal: abort.signal,
+          emit: (text) => stream!.emit(text),
         });
+      } catch (error) {
+        failure = error;
       } finally {
         inCallback -= 1;
       }
+      await stream.flush();
+      if (failure) throw failure;
       const result = validateRelayJson(raw);
       await hitFailpoint(
         points,
         "step.after-user-function-before-completion",
+        { runId, stepKey: name, attempt },
+        options.barrierDir,
+      );
+      await hitFailpoint(
+        points,
+        "stream.after-final-flush-before-completion",
         { runId, stepKey: name, attempt },
         options.barrierDir,
       );
@@ -172,7 +192,7 @@ export async function runActivation(options: {
         sessionId,
         runId,
         fence,
-        { kind: "complete_step", stepKey: name, attempt, attemptToken, result },
+        { kind: "complete_step", stepKey: name, attempt, attemptToken, result, finalBatchSeq: stream.finalBatchSeq() },
         options.completionRequestPath,
         control,
       );
@@ -184,6 +204,7 @@ export async function runActivation(options: {
       );
       return validateRelayJson(completed.result ?? result);
     } finally {
+      stream?.stop();
       inStep = false;
     }
   };
@@ -275,6 +296,12 @@ export async function runActivation(options: {
           }, options.completionRequestPath, control);
       const attempt = Number(started.attempt);
       const attemptToken = String(started.attemptToken);
+      if (restart) {
+        await hitFailpoint(points, "stream.after-supersession-commit-before-new-chunk", { runId, stepKey: child.name, attempt }, options.barrierDir);
+      }
+      const stream = createAttemptEmit((text, batchSeq) => sendStreamBatch(
+        options, control, points, sessionId, runId, fence, child.name, attempt, attemptToken, text, batchSeq,
+      ));
       await hitFailpoint(points, "step.after-start-commit-before-callback", { runId, stepKey: child.name, attempt }, options.barrierDir);
       inCallback += 1;
       try {
@@ -285,6 +312,7 @@ export async function runActivation(options: {
             attempt,
             attemptToken,
             signal: abort.signal,
+            emit: (text) => stream.emit(text),
           });
         } catch (error) {
           if (error instanceof WorkerHttpError || control.lost) throw error;
@@ -293,6 +321,7 @@ export async function runActivation(options: {
           }
           const message = error instanceof Error && error.message.length > 0 ? error.message : "step failed";
           const failure = { code: "StepFailed" as const, message };
+          await stream.flush();
           await postIntent(options, sessionId, runId, fence, {
             kind: "fail_step",
             stepKey: child.name,
@@ -304,6 +333,8 @@ export async function runActivation(options: {
         }
         const result = validateRelayJson(raw);
         await hitFailpoint(points, "step.after-user-function-before-completion", { runId, stepKey: child.name, attempt }, options.barrierDir);
+        await stream.flush();
+        await hitFailpoint(points, "stream.after-final-flush-before-completion", { runId, stepKey: child.name, attempt }, options.barrierDir);
         if (control.lost) throw new Error("lease lost");
         const completed = await postIntent(options, sessionId, runId, fence, {
           kind: "complete_step",
@@ -311,10 +342,12 @@ export async function runActivation(options: {
           attempt,
           attemptToken,
           result,
+          finalBatchSeq: stream.finalBatchSeq(),
         }, options.completionRequestPath, control);
         await hitFailpoint(points, "step.after-completion-commit-before-response", { runId, stepKey: child.name, attempt }, options.barrierDir);
         return { status: "ok", result: validateRelayJson(completed.result ?? result) };
       } finally {
+        stream.stop();
         inCallback -= 1;
       }
     }
@@ -447,6 +480,35 @@ async function postIntent(
 
 function isComplete(intent: Json): boolean {
   return typeof intent === "object" && intent !== null && !Array.isArray(intent) && intent.kind === "complete_step";
+}
+
+async function sendStreamBatch(
+  options: { serverUrl: string; barrierDir?: string },
+  control: { lost: boolean },
+  points: Parameters<typeof hitFailpoint>[0],
+  sessionId: string,
+  runId: string,
+  fence: string,
+  stepKey: string,
+  attempt: number,
+  attemptToken: string,
+  text: string,
+  batchSeq: number,
+): Promise<void> {
+  if (control.lost) throw new Error("lease lost");
+  await postJson(`${options.serverUrl}/worker/v1/stream`, {
+    protocolVersion: PROTOCOL_VERSION,
+    operationId: randomUUID(),
+    workerSessionId: sessionId,
+    runId,
+    fence,
+    stepKey,
+    attempt,
+    attemptToken,
+    batchSeq: String(batchSeq),
+    text,
+  });
+  await hitFailpoint(points, "stream.after-batch-commit-before-response", { runId, stepKey, attempt }, options.barrierDir);
 }
 
 async function postJson(url: string, body: Json): Promise<{ [key: string]: Json }> {

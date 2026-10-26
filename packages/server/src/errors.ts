@@ -1,11 +1,15 @@
 export class HttpError extends Error {
+  readonly details: Record<string, unknown>;
+
   constructor(
     readonly status: number,
     readonly code: string,
     message: string,
+    details: Record<string, unknown> = {},
   ) {
     super(message);
     this.name = "HttpError";
+    this.details = details;
   }
 }
 
@@ -21,6 +25,10 @@ const STATUS: Record<string, number> = {
   DuplicateStepKey: 409,
   Nondeterminism: 409,
   NotExpired: 409,
+  StreamBatchConflict: 409,
+  StreamGap: 409,
+  StreamManifest: 409,
+  StreamExpired: 410,
 };
 
 export function fromDatabaseError(error: unknown): HttpError | null {

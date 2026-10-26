@@ -12,10 +12,12 @@ import {
 } from "@relay/protocol";
 import { callJson, createPool, withTransaction } from "./db.js";
 import { decimalString, fromDatabaseError, HttpError } from "./errors.js";
+import { createStreamHub, type StreamHub } from "./stream-hub.js";
 
 export interface StartedServer {
   url: string;
   close: () => Promise<void>;
+  suppressStreamNotifications(): void;
 }
 
 export async function startServer(options: {
@@ -25,16 +27,44 @@ export async function startServer(options: {
   reaperIntervalMs?: number;
   recoveryBudget?: number;
   port?: number;
+  streamPollMs?: number;
+  streamKeepaliveMs?: number;
+  streamQueueLimit?: number;
+  socketHighWaterMark?: number;
+  streamRetentionIntervalMs?: number;
+  streamRetentionHorizonMs?: number;
+  beforeStreamCatchup?: (runId: string) => Promise<void>;
 }): Promise<StartedServer> {
   const leaseDurationMs = requirePositiveInteger(options.leaseDurationMs, "leaseDurationMs");
   const heartbeatIntervalMs = requirePositiveInteger(options.heartbeatIntervalMs ?? 10_000, "heartbeatIntervalMs");
   const reaperIntervalMs = requireNonNegativeInteger(options.reaperIntervalMs ?? 1_000, "reaperIntervalMs");
   const recoveryBudget = requireRecoveryBudget(options.recoveryBudget ?? 100);
+  const streamRetentionIntervalMs = requireNonNegativeInteger(
+    options.streamRetentionIntervalMs ?? 60_000,
+    "streamRetentionIntervalMs",
+  );
+  const streamRetentionHorizonMs = requireNonNegativeInteger(
+    options.streamRetentionHorizonMs ?? 7 * 24 * 60 * 60 * 1000,
+    "streamRetentionHorizonMs",
+  );
+  if (options.socketHighWaterMark !== undefined) {
+    requirePositiveInteger(options.socketHighWaterMark, "socketHighWaterMark");
+  }
   const pool = createPool(options.appDatabaseUrl);
-  const server = createServer(async (req, res) => {
+  const stream = await createStreamHub({
+    appDatabaseUrl: options.appDatabaseUrl,
+    pool,
+    pollMs: requirePositiveInteger(options.streamPollMs ?? 1_000, "streamPollMs"),
+    keepaliveMs: requirePositiveInteger(options.streamKeepaliveMs ?? 15_000, "streamKeepaliveMs"),
+    queueLimit: requirePositiveInteger(options.streamQueueLimit ?? 32, "streamQueueLimit"),
+    beforeCatchup: options.beforeStreamCatchup,
+  });
+  const server = createServer(
+    options.socketHighWaterMark === undefined ? {} : { highWaterMark: options.socketHighWaterMark },
+    async (req, res) => {
     const requestId = randomUUID();
     try {
-      await route(pool, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId);
+      await route(pool, stream, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId);
     } catch (error) {
       const mapped = error instanceof HttpError ? error : error instanceof RelayJsonError
         ? new HttpError(422, "Serialization", error.message)
@@ -44,7 +74,7 @@ export async function startServer(options: {
         res.end(JSON.stringify({ code: "Internal", message: "internal error", details: {}, requestId }));
         return;
       }
-      sendJson(res, mapped.status, { code: mapped.code, message: mapped.message, details: {}, requestId });
+      sendJson(res, mapped.status, { code: mapped.code, message: mapped.message, details: mapped.details, requestId });
     }
   });
 
@@ -56,6 +86,7 @@ export async function startServer(options: {
     throw new Error("server did not bind a TCP port");
   }
   let reaper: NodeJS.Timeout | undefined;
+  let retention: NodeJS.Timeout | undefined;
   if (reaperIntervalMs > 0) {
     const tick = () => {
       void reapExpiredLeases(pool, 32).catch((error: unknown) => {
@@ -66,20 +97,33 @@ export async function startServer(options: {
     reaper = setInterval(tick, reaperIntervalMs);
     reaper.unref();
   }
+  if (streamRetentionIntervalMs > 0) {
+    const sweep = () => {
+      void expireDueStreams(pool, streamRetentionHorizonMs).catch((error: unknown) => {
+        console.error("stream retention failed", error);
+      });
+    };
+    retention = setInterval(sweep, streamRetentionIntervalMs);
+    retention.unref();
+  }
   return {
     url: `http://127.0.0.1:${address.port}`,
     close: async () => {
       if (reaper) clearInterval(reaper);
+      if (retention) clearInterval(retention);
+      await stream.close();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
       await pool.end();
     },
+    suppressStreamNotifications: () => stream.suppressNotifications(),
   };
 }
 
 async function route(
   pool: ReturnType<typeof createPool>,
+  stream: StreamHub,
   leaseDurationMs: number,
   heartbeatIntervalMs: number,
   recoveryBudget: number,
@@ -212,6 +256,14 @@ async function route(
     return;
   }
 
+  const streamMatch = /^\/v1\/runs\/([0-9a-fA-F-]{36})\/stream$/.exec(url.pathname);
+  if (req.method === "GET" && streamMatch) {
+    const runId = streamMatch[1];
+    if (runId === undefined) throw new HttpError(404, "InvalidRunState", "run not found");
+    await stream.serve(req, res, runId, url);
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/worker/v1/register") {
     const body = await readJson(req);
     requireProtocol(body);
@@ -281,6 +333,35 @@ async function route(
         requiredString(body, "runId"),
         decimalString(body.fence, "fence"),
         requiredString(body, "operationId"),
+        canonicalHash(body),
+      ],
+    );
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/worker/v1/stream") {
+    const body = await readJson(req);
+    requireProtocol(body);
+    const text = requiredString(body, "text");
+    if (text.length === 0) throw new HttpError(422, "Serialization", "stream batch text is empty");
+    if (typeof body.attempt !== "number" || !Number.isInteger(body.attempt)) {
+      throw new HttpError(422, "Serialization", "attempt must be an integer");
+    }
+    const result = await callJson(
+      pool,
+      `SELECT relay_append_stream_batch($1,$2,$3,$4::bigint,$5,$6,$7,$8::bigint,$9,$10,$11) AS result`,
+      [
+        requiredString(body, "operationId"),
+        requiredString(body, "workerSessionId"),
+        requiredString(body, "runId"),
+        decimalString(body.fence, "fence"),
+        requiredString(body, "stepKey"),
+        body.attempt,
+        requiredString(body, "attemptToken"),
+        decimalString(body.batchSeq, "batchSeq"),
+        text,
+        canonicalHash(text),
         canonicalHash(body),
       ],
     );
@@ -425,7 +506,7 @@ async function dispatchIntent(
     }
     return callJson(
       pool,
-      `SELECT relay_complete_step($1,$2,$3,$4::bigint,$5,$6,$7,$8::jsonb,$9) AS result`,
+      `SELECT relay_complete_step($1,$2,$3,$4::bigint,$5,$6,$7,$8::jsonb,$9,$10::bigint) AS result`,
       [
         ctx.operationId,
         ctx.sessionId,
@@ -436,6 +517,7 @@ async function dispatchIntent(
         requiredString(intent, "attemptToken"),
         JSON.stringify(intent.result ?? null),
         ctx.hash,
+        finalBatchSeq(intent.finalBatchSeq),
       ],
     );
   }
@@ -519,6 +601,17 @@ async function readBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+async function expireDueStreams(pool: ReturnType<typeof createPool>, horizonMs: number): Promise<void> {
+  for (let n = 0; n < 32; n += 1) {
+    const status = await callJson(
+      pool,
+      `SELECT relay_expire_streams($1::interval) AS result`,
+      [`${horizonMs} milliseconds`],
+    );
+    if (status !== "expired") return;
+  }
+}
+
 async function reapExpiredLeases(pool: ReturnType<typeof createPool>, limit: number): Promise<void> {
   let expired = 0;
   let tries = 0;
@@ -551,6 +644,12 @@ function idempotencyHeader(req: IncomingMessage): string | null {
     throw new HttpError(422, "Serialization", "Idempotency-Key length is invalid");
   }
   return header;
+}
+
+function finalBatchSeq(value: unknown): string {
+  if (value === undefined) return "-1";
+  if (value === "-1") return "-1";
+  return decimalString(value, "finalBatchSeq");
 }
 
 function pageLimit(raw: string | null): number {

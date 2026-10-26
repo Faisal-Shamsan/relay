@@ -9,3 +9,11 @@ export {
   type WorkflowDefinition,
 } from "./workflow.js";
 export { runActivation, type HeartbeatSchedule } from "./worker.js";
+export {
+  reduceStream,
+  StreamExpiredError,
+  subscribe,
+  type AttemptView,
+  type StreamEvent,
+  type StreamView,
+} from "./subscribe.js";
