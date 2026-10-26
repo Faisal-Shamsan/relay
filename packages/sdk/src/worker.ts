@@ -84,6 +84,7 @@ export async function runActivation(options: {
   const childStates = indexChildren(history);
   const seen = new Set<string>();
   const seenGroups = new Set<string>();
+  const seenHelpers = new Set<string>();
   let nextPos = 0;
   let inStep = false;
   let inCallback = 0;
@@ -396,8 +397,43 @@ export async function runActivation(options: {
     }
   };
 
+  async function recordHelper(kind: "now" | "uuid", key: string): Promise<string>;
+  async function recordHelper(kind: "random", key: string): Promise<number>;
+  async function recordHelper(kind: "now" | "random" | "uuid", key: string): Promise<string | number> {
+    if (inStep || inCallback > 0) throw namedError("ConcurrentCommand", "nested command");
+    if (!validKey(key)) throw namedError("Serialization", "helper key is invalid");
+    const identity = `${kind}:${key}`;
+    if (seenHelpers.has(identity)) throw namedError("DuplicateStepKey", "duplicate helper key");
+    const position = nextPos;
+    const expected = { kind, key };
+    const historical = commands[position];
+    if (historical && !sameHelper(historical.descriptor, expected)) {
+      throw nondeterminism(position, historical.descriptor, expected);
+    }
+    seenHelpers.add(identity);
+    nextPos += 1;
+    inStep = true;
+    try {
+      if (historical?.result !== undefined) return publishHelper(kind, historical.result);
+      const recorded = await postIntent(options, sessionId, runId, fence, {
+        kind: "record_helper",
+        helperKind: kind,
+        key,
+        expectedCommandPos: String(position),
+      }, options.completionRequestPath, control);
+      return publishHelper(kind, recorded.outcome);
+    } finally {
+      inStep = false;
+    }
+  }
+
   try {
-    const output = await options.workflow.fn({ step: Object.assign(step, { parallel }) }, input);
+    const output = await options.workflow.fn({
+      step: Object.assign(step, { parallel }),
+      now: (key) => recordHelper("now", key),
+      random: (key) => recordHelper("random", key),
+      uuid: (key) => recordHelper("uuid", key),
+    }, input);
     beats.stop();
     if (control.lost) throw new Error("lease lost");
     if (nextPos < commands.length) {
@@ -594,7 +630,13 @@ function indexCommands(events: HistoryEvent[]): CommandHistory[] {
     if (event.type === "CommandRecorded" && event.payload.descriptor && typeof event.payload.descriptor === "object" && !Array.isArray(event.payload.descriptor)) {
       const descriptor = event.payload.descriptor;
       const position = Number(event.commandPos ?? commands.length);
-      commands[position] = { descriptor, completed: false };
+      const helper = descriptor.kind === "now" || descriptor.kind === "random" || descriptor.kind === "uuid";
+      const recorded = Object.prototype.hasOwnProperty.call(event.payload, "outcome");
+      commands[position] = {
+        descriptor,
+        completed: helper && recorded,
+        result: helper && recorded ? event.payload.outcome : undefined,
+      };
     }
     if (event.type === "StepCompleted" && event.stepKey) {
       const command = commands.find((item) => item?.descriptor.kind === "step" && item.descriptor.key === event.stepKey);
@@ -706,6 +748,31 @@ function storedFailure(error: Json | undefined): { code: "StepFailed"; message: 
 interface ChildFingerprint {
   explicitInput: boolean;
   inputHash?: string;
+}
+
+function sameHelper(
+  descriptor: { [key: string]: Json },
+  expected: { kind: "now" | "random" | "uuid"; key: string },
+): boolean {
+  return descriptor.kind === expected.kind && descriptor.key === expected.key;
+}
+
+function publishHelper(kind: "now" | "random" | "uuid", value: Json | undefined): string | number {
+  const parsed = validateRelayJson(value ?? null);
+  if (kind === "random") {
+    if (typeof parsed !== "number" || !Number.isFinite(parsed) || parsed < 0 || parsed >= 1) {
+      throw namedError("Serialization", "random helper value is invalid");
+    }
+    return parsed;
+  }
+  if (typeof parsed !== "string") throw namedError("Serialization", "helper value is invalid");
+  if (kind === "now" && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(parsed)) {
+    throw namedError("Serialization", "clock helper value is invalid");
+  }
+  if (kind === "uuid" && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(parsed)) {
+    throw namedError("Serialization", "uuid helper value is invalid");
+  }
+  return parsed;
 }
 
 function sameStep(

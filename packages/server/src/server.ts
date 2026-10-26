@@ -491,6 +491,26 @@ async function dispatchIntent(
       ],
     );
   }
+  if (kind === "record_helper") {
+    const helperKind = requiredString(intent, "helperKind");
+    if (helperKind !== "now" && helperKind !== "random" && helperKind !== "uuid") {
+      throw new HttpError(422, "Serialization", "helper kind is invalid");
+    }
+    return callJson(
+      pool,
+      `SELECT relay_record_helper($1,$2,$3,$4::bigint,$5,$6,$7::bigint,$8) AS result`,
+      [
+        ctx.operationId,
+        ctx.sessionId,
+        ctx.runId,
+        ctx.fence,
+        helperKind,
+        requiredString(intent, "key"),
+        decimalString(intent.expectedCommandPos, "expectedCommandPos"),
+        ctx.hash,
+      ],
+    );
+  }
   if (kind === "start_attempt") {
     return callJson(
       pool,
