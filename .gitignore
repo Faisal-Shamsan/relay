@@ -3,4 +3,11 @@ dist/
 *.log
 *.tsbuildinfo
 .env
+.env*
+*.pem
+*.key
+*.sqlite
+*.sqlite3
+*.db
+*.dump
 coverage/
