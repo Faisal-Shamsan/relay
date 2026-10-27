@@ -92,8 +92,19 @@ The command compares commands, steps, attempts, and the business fields of the r
 - Workers advertise an exact workflow version. A run pinned to v1 stays pending while only a v2 worker is alive.
 - Replay compares command shape. An explicit step input is fingerprinted, and a change is rejected before the stored result is returned. A changed captured value with the same command shape is not detected. `ctx.now`, `ctx.random`, and `ctx.uuid` record one server-generated value. Replay returns that value, and a different key at that position is rejected.
 - A worker can append a durable stream batch, and a client can resume that log over SSE. A finished run's stream log expires seven days after completion. The run result remains, and a later read returns 410. `ctx.sleep` records one database deadline and releases the worker until that deadline fires. A failed run is visible by querying failed runs. There is no signal, dashboard, or metrics endpoint.
+- `lintWorkflow` reports a direct `Date.now`, `Math.random`, `randomUUID`, `process.env`, `fetch`, `globalThis`, or `Promise.all` written outside a step. It reads the function source. It does not follow a call into another function. The same calls inside a step callback are allowed.
 - JSON follows the rules in `packages/protocol/src/json.ts`: the root counts as depth 1, unsafe integers are rejected, the receipt digest is SHA-256, and strings are not Unicode-normalized.
 - Invalid JSON is rejected with a path. It is not rewritten into a stored success.
+
+Check a workflow function before running it:
+
+```javascript
+import { lintWorkflow } from "@relay/sdk";
+
+console.log(lintWorkflow(workflow.fn));
+```
+
+`@relay/sdk` and `@relay/protocol` are the publishable packages, at version 0.1.0. `npm pack` in each package directory, after `npm run build`, includes the built entry and its type declarations. The server package is not published.
 
 ## Failover
 
