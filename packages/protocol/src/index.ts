@@ -12,4 +12,5 @@ export {
 } from "./json.js";
 export { canonicalHash, sha256Hex } from "./hash.js";
 export { logicalStepIdempotencyKey } from "./idempotency.js";
+export { canonicalRetryPolicy, type RetryPolicy } from "./retry.js";
 export { PROTOCOL_VERSION, SEEDED_TENANT_ID, type ErrorBody, type WorkerEventRequest, type WorkerIntent } from "./types.js";

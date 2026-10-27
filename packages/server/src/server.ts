@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import {
   canonicalHash,
   canonicalRelayJson,
+  canonicalRetryPolicy,
   HTTP_BODY_LIMIT,
   parseRelayJson,
   validateRelayJson,
@@ -103,9 +104,11 @@ export async function startServer(options: {
   }
   if (timerIntervalMs > 0) {
     const tick = () => {
-      void fireDueTimers(pool, 32).catch((error: unknown) => {
-        console.error("timer sweep failed", error);
-      });
+      void fireDueTimers(pool, 32)
+        .then(() => fireDueRetries(pool, 32))
+        .catch((error: unknown) => {
+          console.error("timer sweep failed", error);
+        });
     };
     timers = setInterval(tick, timerIntervalMs);
     timers.unref();
@@ -456,10 +459,11 @@ async function dispatchIntent(
     const stepKey = requiredString(intent, "stepKey");
     const expected = decimalString(intent.expectedCommandPos, "expectedCommandPos");
     const explicit = explicitInput(intent);
+    const retry = readRetry(intent.retry);
     return callJson(
       pool,
       `WITH cfg AS (SELECT set_config('relay.recovery_budget', $11, true))
-       SELECT relay_declare_and_start($1,$2,$3,$4::bigint,$5,$6::bigint,$7,$8,$9::jsonb,$10) AS result FROM cfg`,
+       SELECT relay_declare_and_start($1,$2,$3,$4::bigint,$5,$6::bigint,$7,$8,$9::jsonb,$10,$12::jsonb) AS result FROM cfg`,
       [
         ctx.operationId,
         ctx.sessionId,
@@ -472,6 +476,7 @@ async function dispatchIntent(
         explicit.present ? JSON.stringify(explicit.input) : null,
         explicit.hash,
         String(ctx.recoveryBudget),
+        retry === null ? null : JSON.stringify(retry),
       ],
     );
   }
@@ -485,10 +490,11 @@ async function dispatchIntent(
       throw new HttpError(422, "Serialization", "concurrency must be an integer");
     }
     const childInputs = childInputFingerprints(children, intent.childInputs);
+    const childRetries = childRetryPolicies(children, intent.childRetries);
     return callJson(
       pool,
       `WITH cfg AS (SELECT set_config('relay.recovery_budget', $11, true))
-       SELECT relay_declare_parallel($1,$2,$3,$4::bigint,$5,$6::bigint,$7::jsonb,$8,$9,$10::jsonb) AS result FROM cfg`,
+       SELECT relay_declare_parallel($1,$2,$3,$4::bigint,$5,$6::bigint,$7::jsonb,$8,$9,$10::jsonb,$12::jsonb) AS result FROM cfg`,
       [
         ctx.operationId,
         ctx.sessionId,
@@ -501,6 +507,7 @@ async function dispatchIntent(
         ctx.hash,
         childInputs === null ? null : JSON.stringify(childInputs),
         String(ctx.recoveryBudget),
+        childRetries === null ? null : JSON.stringify(childRetries),
       ],
     );
   }
@@ -613,6 +620,16 @@ async function dispatchIntent(
       ],
     );
   }
+  if (kind === "fail_run") {
+    if (!isJsonObject(intent.error) || intent.error.code !== "StepExecutionError" || typeof intent.error.message !== "string") {
+      throw new HttpError(422, "Serialization", "run failure must be a StepExecutionError");
+    }
+    return callJson(
+      pool,
+      `SELECT relay_fail_run($1,$2,$3,$4::bigint,$5::jsonb,$6) AS result`,
+      [ctx.operationId, ctx.sessionId, ctx.runId, ctx.fence, JSON.stringify(intent.error), ctx.hash],
+    );
+  }
   if (kind === "finish_run") {
     return callJson(
       pool,
@@ -630,6 +647,36 @@ function requireProtocol(body: Json): void {
   if (body.protocolVersion !== PROTOCOL_VERSION) {
     throw new HttpError(422, "UnsupportedCapability", "protocol version is not supported");
   }
+}
+
+function readRetry(value: Json | undefined): Json | null {
+  if (value === undefined) return null;
+  return canonicalRetryPolicy(value);
+}
+
+function childRetryPolicies(children: string[], raw: Json | undefined): Json[] | null {
+  if (raw === undefined) return null;
+  if (!Array.isArray(raw) || raw.length !== children.length) {
+    throw new HttpError(422, "Serialization", "child retries must align with children");
+  }
+  let any = false;
+  const specs: Json[] = [];
+  for (const item of raw) {
+    if (!isJsonObject(item) || typeof item.explicitRetry !== "boolean") {
+      throw new HttpError(422, "Serialization", "child retry policy is invalid");
+    }
+    if (!item.explicitRetry) {
+      if ("retry" in item) throw new HttpError(422, "Serialization", "child retry policy is invalid");
+      specs.push({ explicitRetry: false });
+      continue;
+    }
+    if (!("retry" in item) || item.retry === undefined) {
+      throw new HttpError(422, "Serialization", "child retry policy is invalid");
+    }
+    any = true;
+    specs.push({ explicitRetry: true, retry: canonicalRetryPolicy(item.retry) });
+  }
+  return any ? specs : null;
 }
 
 function explicitInput(intent: { [key: string]: Json | undefined }): { present: boolean; input: Json; hash: string | null } {
@@ -719,6 +766,13 @@ async function expireDueStreams(pool: ReturnType<typeof createPool>, horizonMs: 
       [`${horizonMs} milliseconds`],
     );
     if (status !== "expired") return;
+  }
+}
+
+async function fireDueRetries(pool: ReturnType<typeof createPool>, limit: number): Promise<void> {
+  for (let n = 0; n < limit; n += 1) {
+    const status = await callJson(pool, `SELECT relay_fire_one_retry() AS result`, []);
+    if (status !== "fired") return;
   }
 }
 

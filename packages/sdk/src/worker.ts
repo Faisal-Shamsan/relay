@@ -2,16 +2,20 @@ import { writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import {
   canonicalHash,
+  canonicalRetryPolicy,
   logicalStepIdempotencyKey,
   PROTOCOL_VERSION,
+  RelayJsonError,
   SEEDED_TENANT_ID,
   validateRelayJson,
   type Json,
+  type RetryPolicy,
 } from "@relay/protocol";
 import { createAttemptEmit, type AttemptEmit } from "./emit.js";
 import { hitFailpoint, loadFailpointPlan, type FailpointArm } from "./failpoints.js";
 import {
   ParallelStepError,
+  StepExecutionError,
   type ParallelChild,
   type ParallelFailure,
   type StepContext,
@@ -35,7 +39,7 @@ interface CommandHistory {
 }
 
 interface ChildHistory {
-  terminal: "open" | "completed" | "failed";
+  terminal: "open" | "completed" | "failed" | "waiting";
   result?: Json;
   error?: Json;
 }
@@ -105,7 +109,8 @@ export async function runActivation(options: {
   });
 
   async function step(name: string, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json>;
-  async function step(name: string, options: StepOptions, fn: (stepCtx: StepContext, input: Json) => Promise<Json>): Promise<Json>;
+  async function step(name: string, options: { retry: RetryPolicy }, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json>;
+  async function step(name: string, options: { input: Json; retry?: RetryPolicy }, fn: (stepCtx: StepContext, input: Json) => Promise<Json>): Promise<Json>;
   async function step(
     name: string,
     fnOrOptions: ((stepCtx: StepContext) => Promise<Json>) | StepOptions,
@@ -124,10 +129,15 @@ export async function runActivation(options: {
       throw error;
     }
     const position = nextPos;
-    const expected = resolved.explicit === null
-      ? { kind: "step" as const, key: name, explicitInput: false as const }
-      : { kind: "step" as const, key: name, explicitInput: true as const, inputHash: resolved.explicit.hash };
+    const expected = {
+      kind: "step" as const,
+      key: name,
+      explicitInput: resolved.explicit !== null,
+      ...(resolved.explicit === null ? {} : { inputHash: resolved.explicit.hash }),
+      ...(resolved.retry === null ? {} : { retry: resolved.retry }),
+    };
     const historical = commands[position];
+    const prior = childStates.get(name);
     if (historical) {
       if (!sameStep(historical.descriptor, expected)) {
         throw nondeterminism(position, historical.descriptor, expected);
@@ -137,6 +147,9 @@ export async function runActivation(options: {
       if (historical.completed) {
         return validateRelayJson(historical.result ?? null);
       }
+      if (prior?.terminal === "failed") {
+        throw executionError(prior.error);
+      }
     } else {
       seen.add(name);
       nextPos += 1;
@@ -145,23 +158,26 @@ export async function runActivation(options: {
     inStep = true;
     let stream: AttemptEmit | undefined;
     try {
-      const started = historical
-        ? await postIntent(options, sessionId, runId, fence, {
-            kind: "restart_attempt",
-            stepKey: name,
-          }, options.completionRequestPath, control)
-        : await postIntent(options, sessionId, runId, fence, resolved.explicit === null
-          ? {
-              kind: "declare_and_start",
+      const declareIntent: Json = {
+        kind: "declare_and_start",
+        stepKey: name,
+        expectedCommandPos: String(position),
+      };
+      if (resolved.explicit !== null) {
+        declareIntent.explicitInput = true;
+        declareIntent.input = resolved.explicit.input;
+      }
+      if (resolved.retry !== null) declareIntent.retry = resolved.retry;
+      const started = !historical
+        ? await postIntent(options, sessionId, runId, fence, declareIntent, options.completionRequestPath, control)
+        : prior?.terminal === "waiting"
+          ? await postIntent(options, sessionId, runId, fence, {
+              kind: "start_attempt",
               stepKey: name,
-              expectedCommandPos: String(position),
-            }
-          : {
-              kind: "declare_and_start",
+            }, options.completionRequestPath, control)
+          : await postIntent(options, sessionId, runId, fence, {
+              kind: "restart_attempt",
               stepKey: name,
-              expectedCommandPos: String(position),
-              explicitInput: true,
-              input: resolved.explicit.input,
             }, options.completionRequestPath, control);
       const attempt = Number(started.attempt);
       const attemptToken = String(started.attemptToken);
@@ -184,14 +200,32 @@ export async function runActivation(options: {
           signal: abort.signal,
           emit: (text: string) => stream!.emit(text),
         };
-        raw = await resolved.fn(stepCtx, resolved.explicit === null ? null : resolved.explicit.frozen);
+        raw = resolved.explicit === null
+          ? await resolved.fn(stepCtx)
+          : await resolved.fn(stepCtx, resolved.explicit.frozen);
       } catch (error) {
         failure = error;
       } finally {
         inCallback -= 1;
       }
       await stream.flush();
-      if (failure) throw failure;
+      if (failure) {
+        if (engineFailure(failure) || resolved.retry === null) throw failure;
+        const reported = callbackFailure(failure);
+        const failed = await postIntent(options, sessionId, runId, fence, {
+          kind: "fail_step",
+          stepKey: name,
+          attempt,
+          attemptToken,
+          error: reported,
+        }, options.completionRequestPath, control);
+        if (failed.suspended === true) {
+          control.suspended = true;
+          throw namedError("Suspended", "retry suspended the run");
+        }
+        if (failed.exhausted === true) throw new StepExecutionError(reported.message);
+        throw namedError("Suspended", "retry was not scheduled");
+      }
       const result = validateRelayJson(raw);
       await hitFailpoint(
         points,
@@ -214,6 +248,10 @@ export async function runActivation(options: {
         options.completionRequestPath,
         control,
       );
+      if (completed.suspended === true) {
+        control.suspended = true;
+        throw namedError("Suspended", "retry suspended the run");
+      }
       await hitFailpoint(
         points,
         "step.after-completion-commit-before-response",
@@ -246,12 +284,16 @@ export async function runActivation(options: {
     const names: string[] = [];
     const localNames = new Set<string>();
     const childInputs: ChildFingerprint[] = [];
+    const childRetries: ChildRetry[] = [];
     const explicitChildren = new Map<string, Json>();
+    const retryChildren = new Map<string, RetryPolicy>();
     for (const child of children) {
       if (!validKey(child.name)) throw namedError("Serialization", "child step key is invalid");
       if (localNames.has(child.name) || seen.has(child.name)) throw namedError("DuplicateStepKey", "duplicate step key");
       for (const key of Object.keys(child)) {
-        if (key !== "name" && key !== "input" && key !== "run") throw namedError("Serialization", "parallel child options are invalid");
+        if (key !== "name" && key !== "input" && key !== "run" && key !== "retry") {
+          throw namedError("Serialization", "parallel child options are invalid");
+        }
       }
       localNames.add(child.name);
       names.push(child.name);
@@ -263,6 +305,13 @@ export async function runActivation(options: {
       } else {
         childInputs.push({ explicitInput: false });
       }
+      if (child.retry !== undefined) {
+        const policy = readRetry(child.retry);
+        childRetries.push({ explicitRetry: true, retry: policy });
+        retryChildren.set(child.name, policy);
+      } else {
+        childRetries.push({ explicitRetry: false });
+      }
     }
     const position = nextPos;
     const expected = {
@@ -272,6 +321,7 @@ export async function runActivation(options: {
       concurrency,
       explicitInput: false as const,
       childInputs,
+      childRetries,
     };
     const historical = commands[position];
     if (historical && !sameParallel(historical.descriptor, expected)) {
@@ -299,6 +349,14 @@ export async function runActivation(options: {
           }
           declared.childInputs = specs;
         }
+        if (childRetries.some((child) => child.explicitRetry)) {
+          const specs: Json[] = [];
+          for (const child of childRetries) {
+            if (child.explicitRetry) specs.push({ explicitRetry: true, retry: child.retry ?? null });
+            else specs.push({ explicitRetry: false });
+          }
+          declared.childRetries = specs;
+        }
         await postIntent(options, sessionId, runId, fence, declared, options.completionRequestPath, control);
       }
       const outcomes = await settleParallel({
@@ -311,11 +369,16 @@ export async function runActivation(options: {
       });
       const results: Json[] = [];
       const failures: ParallelFailure[] = [];
+      if (outcomes.some((outcome) => outcome.status === "waiting")) {
+        control.suspended = true;
+        throw namedError("Suspended", "retry suspended the run");
+      }
       outcomes.forEach((outcome, index) => {
         if (outcome.status === "ok") {
           results.push(outcome.result);
           return;
         }
+        if (outcome.status !== "failed") return;
         results.push(null);
         failures.push({ index, stepKey: names[index] ?? "", error: outcome.error });
       });
@@ -361,21 +424,24 @@ export async function runActivation(options: {
             ? await child.run(stepCtx, explicitChildren.get(child.name) as Json)
             : await child.run(stepCtx);
         } catch (error) {
-          if (error instanceof WorkerHttpError || control.lost) throw error;
-          if (error instanceof Error && (error.name === "ConcurrentCommand" || error.name === "Nondeterminism" || error.name === "DuplicateStepKey" || error.name === "Serialization")) {
-            throw error;
-          }
-          const message = error instanceof Error && error.message.length > 0 ? error.message : "step failed";
-          const failure = { code: "StepFailed" as const, message };
+          if (error instanceof WorkerHttpError || control.lost || engineFailure(error)) throw error;
+          const reported = callbackFailure(error);
+          const policy = retryChildren.get(child.name) ?? null;
           await stream.flush();
-          await postIntent(options, sessionId, runId, fence, {
+          const failed = await postIntent(options, sessionId, runId, fence, {
             kind: "fail_step",
             stepKey: child.name,
             attempt,
             attemptToken,
-            error: failure,
+            error: policy === null ? { code: "StepFailed", message: reported.message } : reported,
           }, options.completionRequestPath, control);
-          return { status: "failed", error: failure };
+          if (failed.suspended === true) {
+            control.suspended = true;
+            throw namedError("Suspended", "retry suspended the run");
+          }
+          if (policy !== null && failed.retrying === true) return { status: "waiting" };
+          if (policy !== null) return { status: "failed", error: { code: "StepExecutionError", message: reported.message } };
+          return { status: "failed", error: { code: "StepFailed", message: reported.message } };
         }
         const result = validateRelayJson(raw);
         await hitFailpoint(points, "step.after-user-function-before-completion", { runId, stepKey: child.name, attempt }, options.barrierDir);
@@ -390,6 +456,10 @@ export async function runActivation(options: {
           result,
           finalBatchSeq: stream.finalBatchSeq(),
         }, options.completionRequestPath, control);
+        if (completed.suspended === true) {
+          control.suspended = true;
+          throw namedError("Suspended", "retry suspended the run");
+        }
         await hitFailpoint(points, "step.after-completion-commit-before-response", { runId, stepKey: child.name, attempt }, options.barrierDir);
         return { status: "ok", result: validateRelayJson(completed.result ?? result) };
       } finally {
@@ -466,13 +536,26 @@ export async function runActivation(options: {
   }
 
   try {
-    const output = await options.workflow.fn({
+    let output: Json;
+    try {
+      output = await options.workflow.fn({
       step: Object.assign(step, { parallel }),
       now: (key) => recordHelper("now", key),
       random: (key) => recordHelper("random", key),
       uuid: (key) => recordHelper("uuid", key),
       sleep,
     }, input);
+    } catch (error) {
+      if (shouldFailRun(error)) {
+        beats.stop();
+        const message = exhaustionMessage(error);
+        await postIntent(options, sessionId, runId, fence, {
+          kind: "fail_run",
+          error: { code: "StepExecutionError", message },
+        }, options.completionRequestPath, control);
+      }
+      throw error;
+    }
     beats.stop();
     if (control.suspended) throw namedError("Suspended", "timer suspended the run");
     if (control.lost) throw new Error("lease lost");
@@ -708,7 +791,17 @@ function indexChildren(events: HistoryEvent[]): Map<string, ChildHistory> {
       children.set(event.stepKey, { terminal: "completed", result: event.payload.result });
     }
     if (event.type === "StepFailed") {
-      children.set(event.stepKey, { terminal: "failed", error: event.payload.error });
+      if (event.payload.exhausted === false) {
+        children.set(event.stepKey, { terminal: "waiting" });
+      } else if (event.payload.explicitRetry === true) {
+        const message = failureMessage(event.payload.error);
+        children.set(event.stepKey, {
+          terminal: "failed",
+          error: { code: "StepExecutionError", message },
+        });
+      } else {
+        children.set(event.stepKey, { terminal: "failed", error: event.payload.error });
+      }
     }
   }
   return children;
@@ -719,7 +812,9 @@ type ChildOutcome = {
   result: Json;
 } | {
   status: "failed";
-  error: { code: "StepFailed"; message: string };
+  error: { code: "StepFailed" | "StepExecutionError"; message: string };
+} | {
+  status: "waiting";
 };
 
 async function settleParallel(input: {
@@ -785,9 +880,10 @@ async function settleParallel(input: {
   });
 }
 
-function storedFailure(error: Json | undefined): { code: "StepFailed"; message: string } {
-  if (typeof error === "object" && error !== null && !Array.isArray(error) && error.code === "StepFailed" && typeof error.message === "string" && error.message.length > 0) {
-    return { code: "StepFailed", message: error.message };
+function storedFailure(error: Json | undefined): { code: "StepFailed" | "StepExecutionError"; message: string } {
+  if (typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.message === "string" && error.message.length > 0) {
+    if (error.code === "StepExecutionError") return { code: "StepExecutionError", message: error.message };
+    if (error.code === "StepFailed") return { code: "StepFailed", message: error.message };
   }
   return { code: "StepFailed", message: "step failed" };
 }
@@ -795,6 +891,38 @@ function storedFailure(error: Json | undefined): { code: "StepFailed"; message: 
 interface ChildFingerprint {
   explicitInput: boolean;
   inputHash?: string;
+}
+
+interface ChildRetry {
+  explicitRetry: boolean;
+  retry?: RetryPolicy;
+}
+
+function sameRetry(recorded: Json | undefined, expected: RetryPolicy | undefined): boolean {
+  if (expected === undefined) return recorded === undefined;
+  if (typeof recorded !== "object" || recorded === null || Array.isArray(recorded)) return false;
+  const codes = recorded.retryableCodes;
+  return recorded.maxAttempts === expected.maxAttempts
+    && recorded.initialDelayMs === expected.initialDelayMs
+    && recorded.maxDelayMs === expected.maxDelayMs
+    && recorded.multiplier === expected.multiplier
+    && recorded.jitter === expected.jitter
+    && Array.isArray(codes)
+    && codes.length === expected.retryableCodes.length
+    && expected.retryableCodes.every((code, index) => codes[index] === code);
+}
+
+function sameChildRetries(recorded: Json | undefined, expected: ChildRetry[]): boolean {
+  const any = expected.some((child) => child.explicitRetry);
+  if (!any) return recorded === undefined;
+  if (!Array.isArray(recorded) || recorded.length !== expected.length) return false;
+  return expected.every((child, index) => {
+    const row = recorded[index];
+    if (typeof row !== "object" || row === null || Array.isArray(row)) return false;
+    if (row.explicitRetry !== child.explicitRetry) return false;
+    if (!child.explicitRetry) return row.retry === undefined;
+    return sameRetry(row.retry, child.retry);
+  });
 }
 
 function sameSleep(
@@ -833,9 +961,10 @@ function publishHelper(kind: "now" | "random" | "uuid", value: Json | undefined)
 
 function sameStep(
   descriptor: { [key: string]: Json },
-  expected: { kind: "step"; key: string; explicitInput: boolean; inputHash?: string },
+  expected: { kind: "step"; key: string; explicitInput: boolean; inputHash?: string; retry?: RetryPolicy },
 ): boolean {
   if (descriptor.kind !== expected.kind || descriptor.key !== expected.key) return false;
+  if (!sameRetry(descriptor.retry, expected.retry)) return false;
   const recorded = descriptor.explicitInput === true;
   if (recorded !== expected.explicitInput) return false;
   if (!expected.explicitInput) return true;
@@ -844,7 +973,7 @@ function sameStep(
 
 function sameParallel(
   descriptor: { [key: string]: Json },
-  expected: { kind: "parallel"; key: string; children: string[]; concurrency: number; explicitInput: false; childInputs: ChildFingerprint[] },
+  expected: { kind: "parallel"; key: string; children: string[]; concurrency: number; explicitInput: false; childInputs: ChildFingerprint[]; childRetries: ChildRetry[] },
 ): boolean {
   const shape = descriptor.kind === expected.kind
     && descriptor.key === expected.key
@@ -853,7 +982,7 @@ function sameParallel(
     && Array.isArray(descriptor.children)
     && descriptor.children.length === expected.children.length
     && descriptor.children.every((child, index) => child === expected.children[index]);
-  if (!shape) return false;
+  if (!shape || !sameChildRetries(descriptor.childRetries, expected.childRetries)) return false;
   const any = expected.childInputs.some((child) => child.explicitInput);
   const recorded = descriptor.childInputs;
   if (!any) return recorded === undefined;
@@ -870,16 +999,33 @@ function sameParallel(
 function resolveStepCall(
   fnOrOptions: ((stepCtx: StepContext) => Promise<Json>) | StepOptions,
   maybeFn: ((stepCtx: StepContext, input: Json) => Promise<Json>) | undefined,
-): { fn: (stepCtx: StepContext, input: Json) => Promise<Json>; explicit: { input: Json; hash: string; frozen: Json } | null } {
+): {
+  fn: (stepCtx: StepContext, input?: Json) => Promise<Json>;
+  explicit: { input: Json; hash: string; frozen: Json } | null;
+  retry: RetryPolicy | null;
+} {
   if (typeof fnOrOptions === "function") {
     if (maybeFn !== undefined) throw namedError("Serialization", "step options are invalid");
-    return { fn: (stepCtx) => fnOrOptions(stepCtx), explicit: null };
+    return { fn: (stepCtx) => fnOrOptions(stepCtx), explicit: null, retry: null };
   }
-  if (typeof maybeFn !== "function" || !isPlainObject(fnOrOptions) || !("input" in fnOrOptions) || Object.keys(fnOrOptions).length !== 1) {
+  if (typeof maybeFn !== "function" || !isPlainObject(fnOrOptions)) {
     throw namedError("Serialization", "step options are invalid");
   }
-  const input = validateRelayJson(fnOrOptions.input);
-  return { fn: maybeFn, explicit: { input, hash: canonicalHash(input), frozen: freezeJson(input) } };
+  const keys = Object.keys(fnOrOptions);
+  if (keys.length === 0 || keys.some((key) => key !== "input" && key !== "retry")) {
+    throw namedError("Serialization", "step options are invalid");
+  }
+  const retry = "retry" in fnOrOptions && fnOrOptions.retry !== undefined ? readRetry(fnOrOptions.retry) : null;
+  if (!("input" in fnOrOptions)) {
+    const callback = maybeFn as (stepCtx: StepContext) => Promise<Json>;
+    return { fn: (stepCtx) => callback(stepCtx), explicit: null, retry };
+  }
+  const input = validateRelayJson(fnOrOptions.input ?? null);
+  return {
+    fn: (stepCtx, value) => maybeFn(stepCtx, value === undefined ? input : value),
+    explicit: { input, hash: canonicalHash(input), frozen: freezeJson(input) },
+    retry,
+  };
 }
 
 function freezeJson(value: Json): Json {
@@ -898,6 +1044,60 @@ function isPlainObject(value: object): value is { [key: string]: Json | undefine
 
 function validKey(value: string): boolean {
   return typeof value === "string" && value.length > 0 && Buffer.byteLength(value) <= 256;
+}
+
+function readRetry(value: Json): RetryPolicy {
+  try {
+    return canonicalRetryPolicy(value);
+  } catch (error) {
+    if (error instanceof RelayJsonError) throw namedError("Serialization", error.message);
+    throw error;
+  }
+}
+
+function engineFailure(error: unknown): boolean {
+  return error instanceof Error && (
+    error.name === "ConcurrentCommand"
+    || error.name === "Nondeterminism"
+    || error.name === "DuplicateStepKey"
+    || error.name === "Serialization"
+    || error.name === "Suspended"
+  );
+}
+
+function callbackFailure(error: unknown): { code: string; message: string } {
+  const message = error instanceof Error && error.message.length > 0 ? error.message : "step failed";
+  const code = error instanceof Error ? (error as { code?: unknown }).code : undefined;
+  if (typeof code === "string" && code.length > 0 && code !== "StepExecutionError" && Buffer.byteLength(code) <= 64) {
+    return { code, message };
+  }
+  return { code: "StepFailed", message };
+}
+
+function failureMessage(error: Json | undefined): string {
+  if (typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.message === "string" && error.message.length > 0) {
+    return error.message;
+  }
+  return "step failed";
+}
+
+function executionError(error: Json | undefined): StepExecutionError {
+  return new StepExecutionError(failureMessage(error));
+}
+
+function shouldFailRun(error: unknown): boolean {
+  if (error instanceof StepExecutionError) return true;
+  return error instanceof ParallelStepError
+    && error.failures.some((failure) => failure.error.code === "StepExecutionError");
+}
+
+function exhaustionMessage(error: unknown): string {
+  if (error instanceof StepExecutionError && error.message.length > 0) return error.message;
+  if (error instanceof ParallelStepError) {
+    const found = error.failures.find((failure) => failure.error.code === "StepExecutionError");
+    if (found && found.error.message.length > 0) return found.error.message;
+  }
+  return "step failed";
 }
 
 function namedError(name: string, message: string): Error {

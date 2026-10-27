@@ -10,6 +10,7 @@ export type WorkerIntent =
       expectedCommandPos: string;
       explicitInput?: boolean;
       input?: Json;
+      retry?: Json;
     }
   | {
       kind: "declare_parallel";
@@ -18,6 +19,7 @@ export type WorkerIntent =
       children: string[];
       concurrency: number;
       childInputs?: Array<{ explicitInput: boolean; input?: Json }>;
+      childRetries?: Json;
     }
   | {
       kind: "record_helper";
@@ -52,7 +54,11 @@ export type WorkerIntent =
       stepKey: string;
       attempt: number;
       attemptToken: string;
-      error: { code: "StepFailed"; message: string };
+      error: { code: string; message: string };
+    }
+  | {
+      kind: "fail_run";
+      error: { code: "StepExecutionError"; message: string };
     }
   | {
       kind: "finish_run";
