@@ -1,4 +1,6 @@
-import type { Json } from "@relay/protocol";
+import type { Json, RetryPolicy } from "@relay/protocol";
+
+export type { RetryPolicy };
 
 export interface StepContext {
   readonly idempotencyKey: string;
@@ -9,19 +11,30 @@ export interface StepContext {
 }
 
 export interface StepOptions {
-  input: Json;
+  input?: Json;
+  retry?: RetryPolicy;
 }
 
 export interface ParallelChild {
   name: string;
   input?: Json;
+  retry?: RetryPolicy;
   run: (stepCtx: StepContext, input?: Json) => Promise<Json>;
 }
 
 export interface ParallelFailure {
   index: number;
   stepKey: string;
-  error: { code: "StepFailed"; message: string };
+  error: { code: "StepFailed" | "StepExecutionError"; message: string };
+}
+
+export class StepExecutionError extends Error {
+  readonly code = "StepExecutionError" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "StepExecutionError";
+  }
 }
 
 export class ParallelStepError extends Error {
@@ -39,7 +52,8 @@ export class ParallelStepError extends Error {
 export interface WorkflowContext {
   step: {
     (name: string, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json>;
-    (name: string, options: StepOptions, fn: (stepCtx: StepContext, input: Json) => Promise<Json>): Promise<Json>;
+    (name: string, options: { retry: RetryPolicy }, fn: (stepCtx: StepContext) => Promise<Json>): Promise<Json>;
+    (name: string, options: { input: Json; retry?: RetryPolicy }, fn: (stepCtx: StepContext, input: Json) => Promise<Json>): Promise<Json>;
     parallel(
       group: string,
       children: readonly ParallelChild[],

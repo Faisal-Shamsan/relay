@@ -1,13 +1,28 @@
 {
   "name": "@relay/sdk",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Workflow SDK for the Relay durable-execution engine.",
   "license": "Apache-2.0",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Faisal-Shamsan/relay.git",
+    "directory": "packages/sdk"
+  },
+  "files": [
+    "dist/src"
+  ],
+  "types": "./dist/src/index.d.ts",
   "exports": {
-    ".": "./dist/src/index.js"
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
   },
   "dependencies": {
-    "@relay/protocol": "*"
+    "@relay/protocol": "0.1.0"
   }
 }

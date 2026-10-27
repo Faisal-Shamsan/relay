@@ -1,9 +1,11 @@
-export { loadFailpointPlan, type FailpointArm } from "./failpoints.js";
+export { lintWorkflow, type LintFinding, type LintRule } from "./lint.js";
 export {
   defineWorkflow,
   ParallelStepError,
+  StepExecutionError,
   type ParallelChild,
   type ParallelFailure,
+  type RetryPolicy,
   type StepContext,
   type StepOptions,
   type WorkflowContext,
