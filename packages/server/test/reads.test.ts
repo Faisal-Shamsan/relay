@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
+import pg from "pg";
 import { SEEDED_TENANT_ID } from "@relay/protocol";
 import { createTestDatabase, startServer } from "../src/index.js";
 
@@ -142,12 +143,14 @@ test("metrics are current gauges and a failed exporter does not change the commi
     reaperIntervalMs: 0,
     traceEndpoint: "http://127.0.0.1:1/v1/traces",
   });
+  const admin = new pg.Client({ connectionString: db.adminUrl });
+  await admin.connect();
   try {
-    const sessionId = randomUUID();
+    const retired = randomUUID();
     await post(server.url, "/worker/v1/register", {
       protocolVersion: 1,
       operationId: randomUUID(),
-      workerSessionId: sessionId,
+      workerSessionId: retired,
       tenantId: SEEDED_TENANT_ID,
       workflows: [{ name: "demo", version: "demo-v1" }],
     });
@@ -160,26 +163,89 @@ test("metrics are current gauges and a failed exporter does not change the commi
     const runId = String(created.body.runId);
     const replay = await fetch(`${server.url}/v1/runs/${runId}`, { headers: { "x-relay-activity": "replay" } });
     assert.equal(replay.status, 200);
+    await admin.query(
+      `UPDATE worker_sessions SET expires_at = clock_timestamp() - interval '1 second' WHERE id = $1`,
+      [retired],
+    );
+    await post(server.url, "/worker/v1/register", {
+      protocolVersion: 1,
+      operationId: randomUUID(),
+      workerSessionId: randomUUID(),
+      tenantId: SEEDED_TENANT_ID,
+      workflows: [{ name: "demo", version: "demo-v2" }],
+    });
     const metrics = await fetch(`${server.url}/v1/metrics`);
     assert.equal(metrics.status, 200);
     assert.match(metrics.headers.get("content-type") ?? "", /text\/plain/);
     const text = await metrics.text();
     assert.match(text, /relay_runs\{state="pending"} 1/);
     assert.match(text, /relay_pending_runs\{workflow="demo",version="demo-v1"} 1/);
-    assert.match(text, /relay_compatible_workers\{workflow="demo",version="demo-v1"} 1/);
+    assert.match(text, /relay_pending_runs\{workflow="demo",version="demo-v2"} 0/);
+    assert.match(text, /relay_compatible_workers\{workflow="demo",version="demo-v1"} 0/);
+    assert.match(text, /relay_compatible_workers\{workflow="demo",version="demo-v2"} 1/);
     assert.equal(/cost/i.test(text), false);
-    await waitFor(() => received.join("\n").includes("replay") && received.join("\n").includes("callback"));
+
+    const owner = randomUUID();
+    await post(server.url, "/worker/v1/register", {
+      protocolVersion: 1,
+      operationId: randomUUID(),
+      workerSessionId: owner,
+      tenantId: SEEDED_TENANT_ID,
+      workflows: [{ name: "demo", version: "demo-v1" }],
+    });
+    const leased = await post(server.url, "/worker/v1/lease", {
+      protocolVersion: 1,
+      operationId: randomUUID(),
+      workerSessionId: owner,
+    });
+    assert.equal(leased.status, 200);
+    assert.equal(leased.body.runId, runId);
+    const started = await post(server.url, "/worker/v1/events", {
+      protocolVersion: 1,
+      operationId: randomUUID(),
+      workerSessionId: owner,
+      runId,
+      fence: leased.body.fence,
+      intent: { kind: "declare_and_start", stepKey: "only", expectedCommandPos: "0" },
+    }, { "x-relay-activity": "callback" });
+    assert.equal(started.status, 200);
+    const completed = await post(server.url, "/worker/v1/events", {
+      protocolVersion: 1,
+      operationId: randomUUID(),
+      workerSessionId: owner,
+      runId,
+      fence: leased.body.fence,
+      intent: {
+        kind: "complete_step",
+        stepKey: "only",
+        attempt: 1,
+        attemptToken: started.body.attemptToken,
+        result: { ok: true },
+      },
+    }, { "x-relay-activity": "callback" });
+    assert.equal(completed.status, 200);
+
+    await waitFor(() => {
+      const text = received.join("\n");
+      return text.includes("replay") && text.includes("relay.attempt") && text.includes("\"only\"");
+    });
     const spans = received.map((body) => JSON.parse(body) as {
       resourceSpans: Array<{ scopeSpans: Array<{ spans: Array<{ attributes: Array<{ key: string; value: { stringValue: string } }> }> }> }>;
     });
-    const activities = spans.flatMap((span) => span.resourceSpans[0]?.scopeSpans[0]?.spans[0]?.attributes ?? [])
-      .filter((item) => item.key === "relay.activity")
-      .map((item) => item.value.stringValue);
-    assert.deepEqual(activities.sort(), ["callback", "replay"]);
-    const runIds = spans.flatMap((span) => span.resourceSpans[0]?.scopeSpans[0]?.spans[0]?.attributes ?? [])
-      .filter((item) => item.key === "relay.run_id")
-      .map((item) => item.value.stringValue);
-    assert.equal(runIds.includes(runId), true);
+    const attributes = spans.flatMap((span) => span.resourceSpans[0]?.scopeSpans[0]?.spans[0]?.attributes ?? []);
+    const activities = attributes.filter((item) => item.key === "relay.activity").map((item) => item.value.stringValue);
+    assert.equal(activities.includes("callback"), true);
+    assert.equal(activities.includes("replay"), true);
+    const completion = spans
+      .map((span) => span.resourceSpans[0]?.scopeSpans[0]?.spans[0]?.attributes ?? [])
+      .find((items) => items.some((item) => item.key === "relay.step_key" && item.value.stringValue === "only"
+        && items.some((attempt) => attempt.key === "relay.attempt" && attempt.value.stringValue === "1")));
+    assert.equal(completion !== undefined, true);
+    const values = new Map((completion ?? []).map((item) => [item.key, item.value.stringValue]));
+    assert.equal(values.get("relay.run_id"), runId);
+    assert.equal(values.get("relay.fence"), "1");
+    assert.equal(values.get("relay.activity"), "callback");
+    assert.match(values.get("relay.request_id") ?? "", /^[0-9a-f-]{36}$/);
 
     const stillCommitted = await post(dead.url, "/v1/runs", {
       workflowName: "demo",
@@ -192,6 +258,7 @@ test("metrics are current gauges and a failed exporter does not change the commi
   } finally {
     await server.close();
     await dead.close();
+    await admin.end();
     await new Promise<void>((resolve, reject) => collector.close((error) => (error ? reject(error) : resolve())));
     await db.drop();
   }
