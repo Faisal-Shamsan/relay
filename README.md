@@ -18,7 +18,7 @@ npm install
 npm test
 ```
 
-`npm test` starts the local Postgres container if needed, builds the packages, and runs the suite against real databases. The failure demo prints a ledger. Those timings are measurements from that run, not a performance promise. Stream catch-up, 1,000-run, and 10,000-run figures are not measured.
+`npm test` starts the local Postgres container if needed, builds the packages, and runs the suite against real databases. The failure demo prints a ledger. The activation times and the history-byte total are measurements from that 100-run, not a performance promise. Stream catch-up, 1,000 runs, 10,000 runs, Postgres CPU, and a separate replay duration are not measured.
 
 To reprint the demo ledger:
 
@@ -83,7 +83,13 @@ Check projections without changing them:
 node packages/server/dist/src/main.js projections verify <run-id>
 ```
 
-The command compares commands, steps, attempts, and the business fields of the run with the event history. It also checks that the event, command, step, fence, and stream counters still match, and that chunk batches and completion controls line up with the attempts. An expired stream matches when its rows are gone and its sequence counter still points past the last allocated id. It does not rebuild rows, and it does not rewind leases or receipts. Exit 0 means the comparison matched.
+The command compares commands, steps, attempts, and the business fields of the run with the event history. It also checks that the event, command, step, fence, and stream counters still match, and that chunk batches and completion controls line up with the attempts. An expired stream matches when its rows are gone and its sequence counter still points past the last allocated id. It does not rewind leases or receipts. Exit 0 means the comparison matched.
+
+Repair business projections from the same history. The run must be quiesced: a live lease is refused and nothing is written. A second rebuild of an already-correct run is safe. Counters, receipts, the queue, and the stream log stay where they are. Use an admin URL, because the application role cannot execute the repair.
+
+```sh
+node packages/server/dist/src/main.js projections rebuild <run-id>
+```
 
 ## Limits
 
@@ -91,7 +97,8 @@ The command compares commands, steps, attempts, and the business fields of the r
 - Without an explicit retry policy, a recorded callback failure is not retried. Crash recovery stops at the recovery budget stored on the step. The default is 100. An explicit `retry` policy stores one backoff, including its jitter, and that same deadline is what a later attempt uses.
 - Workers advertise an exact workflow version. A run pinned to v1 stays pending while only a v2 worker is alive.
 - Replay compares command shape. An explicit step input is fingerprinted, and a change is rejected before the stored result is returned. A changed captured value with the same command shape is not detected. `ctx.now`, `ctx.random`, and `ctx.uuid` record one server-generated value. Replay returns that value, and a different key at that position is rejected.
-- A worker can append a durable stream batch, and a client can resume that log over SSE. A finished run's stream log expires seven days after completion. The run result remains, and a later read returns 410. `ctx.sleep` records one database deadline and releases the worker until that deadline fires. A failed run is visible by querying failed runs. There is no signal, dashboard, or metrics endpoint.
+- A worker can append a durable stream batch, and a client can resume that log over SSE. A finished run's stream log expires seven days after completion. The run result remains, and a later read returns 410. `ctx.sleep` records one database deadline and releases the worker until that deadline fires. `GET /v1/runs?state=failed` lists failed run rows. There is no signal or cancellation API.
+- `GET /v1/metrics` reports current run, pending-version, and live-worker gauges. It does not keep a cost series. A trace export is optional. If `RELAY_OTEL_ENDPOINT` is unset or the export fails, the transition still commits. The dashboard in `packages/dashboard` reads those HTTP APIs and the SSE stream. It does not open the database. `npm run dev` in that package needs `RELAY_SERVER_URL`.
 - `lintWorkflow` reports a direct `Date.now`, `Math.random`, `randomUUID`, `process.env`, `fetch`, `globalThis`, or `Promise.all` written outside a step. It reads the function source. It does not follow a call into another function. The same calls inside a step callback are allowed.
 - JSON follows the rules in `packages/protocol/src/json.ts`: the root counts as depth 1, unsafe integers are rejected, the receipt digest is SHA-256, and strings are not Unicode-normalized.
 - Invalid JSON is rejected with a path. It is not rewritten into a stored success.

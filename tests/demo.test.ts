@@ -120,6 +120,12 @@ test("phase 1 demo: about 100 runs recover without a stale completion", { timeou
     );
     assert.equal(memoAttempts.rows[0]?.count, 1);
 
+    const history = await admin.query<{ bytes: string }>(
+      `SELECT coalesce(sum(octet_length(payload::text)), 0)::text AS bytes
+       FROM run_events
+       WHERE run_id = ANY($1::uuid[])`,
+      [runIds],
+    );
     const postgres = await admin.query<{ version: string }>(`SELECT version()`);
     let commit = "unknown";
     try {
@@ -143,7 +149,8 @@ test("phase 1 demo: about 100 runs recover without a stale completion", { timeou
       `lease crash callbacks ${leaseCrash.invocations}`,
       `effect crash callbacks ${effectCrash.invocations} provider effects ${effectCrash.effects}`,
       `memoized recovery callbacks ${memoCrash.invocations}`,
-      "not measured: stream catch-up, 1000 runs, 10000 runs, postgres CPU",
+      `history bytes ${history.rows[0]?.bytes ?? "0"}`,
+      "not measured: stream catch-up, 1000 runs, 10000 runs, postgres CPU, replay duration",
       "effect dedupe is the fake provider, not an exactly-once claim",
     ].join("\n"));
   } finally {

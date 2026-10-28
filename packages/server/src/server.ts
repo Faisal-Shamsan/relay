@@ -15,6 +15,7 @@ import {
 import { callJson, createPool, withTransaction } from "./db.js";
 import { decimalString, fromDatabaseError, HttpError } from "./errors.js";
 import { createStreamHub, type StreamHub } from "./stream-hub.js";
+import { exportRequestSpan, type RequestSpan } from "./trace.js";
 
 export interface StartedServer {
   url: string;
@@ -37,6 +38,7 @@ export async function startServer(options: {
   streamRetentionIntervalMs?: number;
   streamRetentionHorizonMs?: number;
   beforeStreamCatchup?: (runId: string) => Promise<void>;
+  traceEndpoint?: string;
 }): Promise<StartedServer> {
   const leaseDurationMs = requirePositiveInteger(options.leaseDurationMs, "leaseDurationMs");
   const heartbeatIntervalMs = requirePositiveInteger(options.heartbeatIntervalMs ?? 10_000, "heartbeatIntervalMs");
@@ -63,22 +65,34 @@ export async function startServer(options: {
     queueLimit: requirePositiveInteger(options.streamQueueLimit ?? 32, "streamQueueLimit"),
     beforeCatchup: options.beforeStreamCatchup,
   });
+  const traceEndpoint = options.traceEndpoint ?? process.env.RELAY_OTEL_ENDPOINT;
   const server = createServer(
     options.socketHighWaterMark === undefined ? {} : { highWaterMark: options.socketHighWaterMark },
     async (req, res) => {
     const requestId = randomUUID();
+    const span: RequestSpan = {
+      requestId,
+      method: req.method ?? "",
+      target: req.url ?? "/",
+      status: 500,
+    };
     try {
-      await route(pool, stream, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId);
+      await route(pool, stream, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId, span);
+      span.status = res.statusCode || span.status;
     } catch (error) {
       const mapped = error instanceof HttpError ? error : error instanceof RelayJsonError
         ? new HttpError(422, "Serialization", error.message)
         : fromDatabaseError(error);
       if (!mapped) {
+        span.status = 500;
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ code: "Internal", message: "internal error", details: {}, requestId }));
-        return;
+      } else {
+        span.status = mapped.status;
+        sendJson(res, mapped.status, { code: mapped.code, message: mapped.message, details: mapped.details, requestId });
       }
-      sendJson(res, mapped.status, { code: mapped.code, message: mapped.message, details: mapped.details, requestId });
+    } finally {
+      await exportRequestSpan(traceEndpoint, span);
     }
   });
 
@@ -147,8 +161,13 @@ async function route(
   req: IncomingMessage,
   res: ServerResponse,
   requestId: string,
+  span: RequestSpan,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  const runInPath = /\/runs\/([0-9a-fA-F-]{36})/.exec(url.pathname);
+  if (runInPath?.[1]) span.runId = runInPath[1];
+  const activity = req.headers["x-relay-activity"];
+  if (activity === "replay" || activity === "callback") span.activity = activity;
   if (req.method === "POST" && url.pathname === "/v1/runs") {
     const body = await readJson(req);
     const workflowName = requiredString(body, "workflowName");
@@ -167,6 +186,7 @@ async function route(
     if (typeof created !== "object" || created === null || Array.isArray(created) || typeof created.runId !== "string") {
       throw new Error("create response was not an object");
     }
+    span.runId = created.runId;
     sendJson(res, created.created === false ? 200 : 201, { runId: created.runId });
     return;
   }
@@ -193,6 +213,48 @@ async function route(
       return listed.rows;
     });
     sendJson(res, 200, { workflows: rows });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/runs") {
+    const state = url.searchParams.get("state");
+    const workflow = url.searchParams.get("workflow");
+    const version = url.searchParams.get("version");
+    if (state !== null && !RUN_STATES.has(state)) {
+      throw new HttpError(422, "Serialization", "state is not a run state");
+    }
+    const cursor = decimalCursor(url.searchParams.get("cursor"));
+    const limit = pageLimit(url.searchParams.get("limit"));
+    const rows = await withTransaction(pool, async (client) => {
+      const listed = await client.query(
+        `SELECT r.id::text AS "runId", r.state, wv.name AS "workflowName", wv.version AS "workflowVersion"
+         FROM runs r
+         JOIN workflow_versions wv ON wv.id = r.workflow_version_id
+         WHERE r.tenant_id = $1
+           AND ($2::text IS NULL OR r.state = $2)
+           AND ($3::text IS NULL OR wv.name = $3)
+           AND ($4::text IS NULL OR wv.version = $4)
+         ORDER BY r.created_at, r.id
+         OFFSET $5::bigint
+         LIMIT $6`,
+        [SEEDED_TENANT_ID, state, workflow, version, cursor, limit + 1],
+      );
+      return listed.rows as Array<{
+        runId: string;
+        state: string;
+        workflowName: string;
+        workflowVersion: string;
+      }>;
+    });
+    const more = rows.length > limit;
+    const runs = more ? rows.slice(0, limit) : rows;
+    const next = more ? String(BigInt(cursor) + BigInt(limit)) : null;
+    sendJson(res, 200, { runs, next });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/metrics") {
+    sendText(res, 200, await metricsText(pool));
     return;
   }
 
@@ -270,6 +332,71 @@ async function route(
     const more = page.length > limit;
     const events = more ? page.slice(0, limit) : page;
     sendJson(res, 200, { events, next: more ? events[events.length - 1]?.seq ?? null : null });
+    return;
+  }
+
+  const stepsMatch = /^\/v1\/runs\/([0-9a-fA-F-]{36})\/steps$/.exec(url.pathname);
+  if (req.method === "GET" && stepsMatch) {
+    const runId = stepsMatch[1];
+    if (runId === undefined) throw new HttpError(404, "InvalidRunState", "run not found");
+    const page = await withTransaction(pool, async (client) => {
+      const exists = await client.query(`SELECT 1 FROM runs WHERE id = $1 AND tenant_id = $2`, [runId, SEEDED_TENANT_ID]);
+      if (exists.rowCount === 0) return null;
+      const steps = await client.query(
+        `SELECT s.step_key AS "stepKey",
+                s.state,
+                s.attempt,
+                s.child_index AS "childIndex",
+                s.input_present AS "explicitInput",
+                CASE WHEN s.input_present THEN s.input ELSE NULL END AS input,
+                s.output,
+                s.error,
+                COALESCE(
+                  (
+                    SELECT jsonb_agg(jsonb_build_object(
+                      'attempt', a.attempt,
+                      'state', a.state,
+                      'fence', a.fence::text
+                    ) ORDER BY a.attempt)
+                    FROM step_attempts a
+                    WHERE a.run_id = s.run_id AND a.step_key = s.step_key
+                  ),
+                  '[]'::jsonb
+                ) AS attempts
+         FROM steps s
+         WHERE s.run_id = $1
+         ORDER BY s.first_seen_ordinal`,
+        [runId],
+      );
+      return steps.rows as Array<{
+        stepKey: string;
+        state: string;
+        attempt: number;
+        childIndex: number;
+        explicitInput: boolean;
+        input: Json | null;
+        output: Json | null;
+        error: Json | null;
+        attempts: Array<{ attempt: number; state: string; fence: string }>;
+      }>;
+    });
+    if (page === null) throw new HttpError(404, "InvalidRunState", "run not found");
+    sendJson(res, 200, {
+      steps: page.map((step) => {
+        const view: { [key: string]: Json } = {
+          stepKey: step.stepKey,
+          state: step.state,
+          attempt: step.attempt,
+          childIndex: step.childIndex,
+          explicitInput: step.explicitInput,
+          output: step.output,
+          error: step.error,
+          attempts: step.attempts as Json,
+        };
+        if (step.explicitInput) view.input = step.input;
+        return view;
+      }),
+    });
     return;
   }
 
@@ -433,6 +560,12 @@ async function route(
     const operationId = requiredString(body, "operationId");
     const runId = requiredString(body, "runId");
     const fence = decimalString(body.fence, "fence");
+    span.runId = runId;
+    span.fence = fence;
+    const stepKey = (intent as { stepKey?: unknown }).stepKey;
+    const attempt = (intent as { attempt?: unknown }).attempt;
+    if (typeof stepKey === "string") span.stepKey = stepKey;
+    if (typeof attempt === "number" || typeof attempt === "string") span.attempt = String(attempt);
     const hash = canonicalHash(body);
     const result = await dispatchIntent(pool, kind, intent as { kind: string; [key: string]: Json }, {
       sessionId,
@@ -823,6 +956,85 @@ function finalBatchSeq(value: unknown): string {
   return decimalString(value, "finalBatchSeq");
 }
 
+const RUN_STATES = new Set([
+  "pending",
+  "running",
+  "sleeping",
+  "retrying",
+  "waiting",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
+function decimalCursor(raw: string | null): string {
+  const text = raw ?? "0";
+  if (!/^[0-9]+$/.test(text) || text.length > 18) {
+    throw new HttpError(422, "Serialization", "cursor must be a decimal string");
+  }
+  return text;
+}
+
+async function metricsText(pool: ReturnType<typeof createPool>): Promise<string> {
+  const snapshot = await withTransaction(pool, async (client) => {
+    const states = await client.query<{ state: string; n: number }>(
+      `SELECT s.state, count(r.id)::int AS n
+       FROM (VALUES
+         ('pending'), ('running'), ('sleeping'), ('retrying'),
+         ('waiting'), ('completed'), ('failed'), ('cancelled')
+       ) AS s(state)
+       LEFT JOIN runs r ON r.state = s.state AND r.tenant_id = $1
+       GROUP BY s.state
+       ORDER BY s.state`,
+      [SEEDED_TENANT_ID],
+    );
+    const versions = await client.query<{
+      workflow: string;
+      version: string;
+      pending: number;
+      workers: number;
+    }>(
+      `SELECT wv.name AS workflow,
+              wv.version,
+              (SELECT count(*)::int
+               FROM runs r
+               WHERE r.workflow_version_id = wv.id
+                 AND r.state = 'pending') AS pending,
+              (SELECT count(*)::int
+               FROM worker_session_versions m
+               JOIN worker_sessions s ON s.id = m.worker_session_id
+               WHERE m.workflow_version_id = wv.id
+                 AND s.expires_at > clock_timestamp()) AS workers
+       FROM workflow_versions wv
+       WHERE wv.tenant_id = $1
+       ORDER BY wv.name, wv.version`,
+      [SEEDED_TENANT_ID],
+    );
+    return { states: states.rows, versions: versions.rows };
+  });
+  const lines = ["# TYPE relay_runs gauge"];
+  for (const row of snapshot.states) {
+    lines.push(`relay_runs{state="${labelValue(row.state)}"} ${row.n}`);
+  }
+  lines.push("# TYPE relay_pending_runs gauge");
+  for (const row of snapshot.versions) {
+    lines.push(
+      `relay_pending_runs{workflow="${labelValue(row.workflow)}",version="${labelValue(row.version)}"} ${row.pending}`,
+    );
+  }
+  lines.push("# TYPE relay_compatible_workers gauge");
+  for (const row of snapshot.versions) {
+    lines.push(
+      `relay_compatible_workers{workflow="${labelValue(row.workflow)}",version="${labelValue(row.version)}"} ${row.workers}`,
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function labelValue(value: string): string {
+  return value.replaceAll("\\", "\\\\").replaceAll("\n", "\\n").replaceAll("\"", "\\\"");
+}
+
 function pageLimit(raw: string | null): number {
   const text = raw ?? "100";
   if (!/^[0-9]+$/.test(text)) throw new HttpError(422, "Serialization", "limit must be a positive integer");
@@ -843,4 +1055,9 @@ function requireNonNegativeInteger(value: number, name: string): number {
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
+}
+
+function sendText(res: ServerResponse, status: number, body: string): void {
+  res.writeHead(status, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
+  res.end(body);
 }

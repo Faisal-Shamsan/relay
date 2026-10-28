@@ -174,11 +174,11 @@ export async function runActivation(options: {
           ? await postIntent(options, sessionId, runId, fence, {
               kind: "start_attempt",
               stepKey: name,
-            }, options.completionRequestPath, control)
+            }, options.completionRequestPath, control, "replay")
           : await postIntent(options, sessionId, runId, fence, {
               kind: "restart_attempt",
               stepKey: name,
-            }, options.completionRequestPath, control);
+            }, options.completionRequestPath, control, "replay");
       const attempt = Number(started.attempt);
       const attemptToken = String(started.attemptToken);
       if (historical) {
@@ -218,7 +218,7 @@ export async function runActivation(options: {
           attempt,
           attemptToken,
           error: reported,
-        }, options.completionRequestPath, control);
+        }, options.completionRequestPath, control, "callback");
         if (failed.suspended === true) {
           control.suspended = true;
           throw namedError("Suspended", "retry suspended the run");
@@ -247,6 +247,7 @@ export async function runActivation(options: {
         { kind: "complete_step", stepKey: name, attempt, attemptToken, result, finalBatchSeq: stream.finalBatchSeq() },
         options.completionRequestPath,
         control,
+        "callback",
       );
       if (completed.suspended === true) {
         control.suspended = true;
@@ -395,7 +396,7 @@ export async function runActivation(options: {
         ? await postIntent(options, sessionId, runId, fence, {
             kind: "restart_attempt",
             stepKey: child.name,
-          }, options.completionRequestPath, control)
+          }, options.completionRequestPath, control, "replay")
         : await postIntent(options, sessionId, runId, fence, {
             kind: "start_attempt",
             stepKey: child.name,
@@ -434,7 +435,7 @@ export async function runActivation(options: {
             attempt,
             attemptToken,
             error: policy === null ? { code: "StepFailed", message: reported.message } : reported,
-          }, options.completionRequestPath, control);
+          }, options.completionRequestPath, control, "callback");
           if (failed.suspended === true) {
             control.suspended = true;
             throw namedError("Suspended", "retry suspended the run");
@@ -455,7 +456,7 @@ export async function runActivation(options: {
           attemptToken,
           result,
           finalBatchSeq: stream.finalBatchSeq(),
-        }, options.completionRequestPath, control);
+        }, options.completionRequestPath, control, "callback");
         if (completed.suspended === true) {
           control.suspended = true;
           throw namedError("Suspended", "retry suspended the run");
@@ -664,6 +665,7 @@ async function postIntent(
   intent: Json,
   completionRequestPath: string | undefined,
   control: { lost: boolean },
+  activity?: "replay" | "callback",
 ): Promise<{ [key: string]: Json }> {
   if (control.lost) throw new Error("lease lost");
   const body = {
@@ -677,7 +679,11 @@ async function postIntent(
   if (completionRequestPath && isComplete(intent)) {
     writeFileSync(completionRequestPath, JSON.stringify(body));
   }
-  return postJson(`${options.serverUrl}/worker/v1/events`, body);
+  return postJson(
+    `${options.serverUrl}/worker/v1/events`,
+    body,
+    activity ? { "x-relay-activity": activity } : undefined,
+  );
 }
 
 function isComplete(intent: Json): boolean {
@@ -713,10 +719,14 @@ async function sendStreamBatch(
   await hitFailpoint(points, "stream.after-batch-commit-before-response", { runId, stepKey, attempt }, options.barrierDir);
 }
 
-async function postJson(url: string, body: Json): Promise<{ [key: string]: Json }> {
+async function postJson(
+  url: string,
+  body: Json,
+  headers?: { [key: string]: string },
+): Promise<{ [key: string]: Json }> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
   const text = await response.text();
