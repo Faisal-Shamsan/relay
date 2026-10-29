@@ -24,7 +24,7 @@ form, table {
 form {
   display: flex;
   gap: 12px;
-  align-items: end;
+  align-items: flex-end;
   margin-bottom: 16px;
 }
 
