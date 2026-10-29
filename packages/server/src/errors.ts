@@ -29,6 +29,7 @@ const STATUS: Record<string, number> = {
   StreamGap: 409,
   StreamManifest: 409,
   StreamExpired: 410,
+  Unauthorized: 401,
 };
 
 export function fromDatabaseError(error: unknown): HttpError | null {

@@ -1,9 +1,18 @@
+const LOCAL_CLIENT_KEY = "relay_dev_client_key";
+
 export function serverUrl(): string {
   return process.env.RELAY_SERVER_URL ?? "http://127.0.0.1:8080";
 }
 
+export function clientKey(): string {
+  return process.env.RELAY_API_KEY ?? LOCAL_CLIENT_KEY;
+}
+
 export async function readJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${serverUrl()}${path}`, { cache: "no-store" });
+  const response = await fetch(`${serverUrl()}${path}`, {
+    cache: "no-store",
+    headers: { authorization: `Bearer ${clientKey()}` },
+  });
   if (!response.ok) {
     throw new Error(`${response.status} ${path}`);
   }

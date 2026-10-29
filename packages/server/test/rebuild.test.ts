@@ -18,6 +18,7 @@ test("F36 rebuild restores a tampered result and leaves coordination state", asy
   const admin = new pg.Client({ connectionString: db.adminUrl });
   await app.connect();
   await admin.connect();
+  await app.query(`SELECT set_config('app.tenant_id', $1, false)`, [SEEDED_TENANT_ID]);
   try {
     const runId = await finishRun(app);
     const before = await coordination(admin, runId);

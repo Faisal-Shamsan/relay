@@ -56,6 +56,7 @@ export async function runActivation(options: {
   barrierDir?: string;
   completionRequestPath?: string;
   heartbeatRequestPath?: string;
+  apiKey?: string;
   tenantId?: string;
   schedule?: (delayMs: number, run: () => void) => HeartbeatSchedule;
 }): Promise<Json> {
@@ -68,12 +69,12 @@ export async function runActivation(options: {
     workerSessionId: sessionId,
     tenantId,
     workflows: [{ name: options.workflow.name, version: options.workflow.version }],
-  });
+  }, credentialHeader(options.apiKey));
   const lease = await postJson(`${options.serverUrl}/worker/v1/lease`, {
     protocolVersion: PROTOCOL_VERSION,
     operationId: randomUUID(),
     workerSessionId: sessionId,
-  });
+  }, credentialHeader(options.apiKey));
   if (lease.workflowName !== options.workflow.name || lease.workflowVersion !== options.workflow.version) {
     throw new Error("leased workflow does not match the worker");
   }
@@ -82,7 +83,7 @@ export async function runActivation(options: {
   const fence = String(lease.fence);
   const watermark = String(lease.historyWatermark);
   const heartbeatIntervalMs = positiveInterval(lease.heartbeatIntervalMs);
-  const history = await getHistory(options.serverUrl, runId, sessionId, watermark);
+  const history = await getHistory(options.serverUrl, runId, sessionId, watermark, options.apiKey);
   const input = inputFromHistory(history);
   const commands = indexCommands(history);
   const childStates = indexChildren(history);
@@ -104,6 +105,7 @@ export async function runActivation(options: {
     points,
     barrierDir: options.barrierDir,
     heartbeatRequestPath: options.heartbeatRequestPath,
+    apiKey: options.apiKey,
     abort,
     control,
   });
@@ -501,6 +503,42 @@ export async function runActivation(options: {
     }
   }
 
+  async function waitForEvent(name: string, wait: { timeoutMs: number }): Promise<Json> {
+    if (control.suspended) throw namedError("Suspended", "wait suspended the run");
+    if (inStep || inCallback > 0) throw namedError("ConcurrentCommand", "nested command");
+    if (!validKey(name)) throw namedError("Serialization", "wait name is invalid");
+    if (!Number.isSafeInteger(wait.timeoutMs) || wait.timeoutMs < 0) {
+      throw namedError("Serialization", "timeoutMs must be a nonnegative safe integer");
+    }
+    const identity = `wait:${name}`;
+    if (seenHelpers.has(identity)) throw namedError("DuplicateStepKey", "duplicate wait name");
+    const position = nextPos;
+    const expected = { kind: "wait" as const, key: name, timeoutMs: wait.timeoutMs };
+    const historical = commands[position];
+    if (historical && !sameWait(historical.descriptor, expected)) {
+      throw nondeterminism(position, historical.descriptor, expected);
+    }
+    seenHelpers.add(identity);
+    nextPos += 1;
+    if (historical?.completed) return validateRelayJson(historical.result ?? null);
+    inStep = true;
+    try {
+      const recorded = await postIntent(options, sessionId, runId, fence, {
+        kind: "schedule_wait",
+        key: name,
+        timeoutMs: wait.timeoutMs,
+        expectedCommandPos: String(position),
+      }, options.completionRequestPath, control);
+      if (recorded.suspended === true) {
+        control.suspended = true;
+        throw namedError("Suspended", "wait suspended the run");
+      }
+      return validateRelayJson(recorded.result ?? null);
+    } finally {
+      inStep = false;
+    }
+  }
+
   async function sleep(key: string, durationMs: number): Promise<void> {
     if (control.suspended) throw namedError("Suspended", "timer suspended the run");
     if (inStep || inCallback > 0) throw namedError("ConcurrentCommand", "nested command");
@@ -545,6 +583,7 @@ export async function runActivation(options: {
       random: (key) => recordHelper("random", key),
       uuid: (key) => recordHelper("uuid", key),
       sleep,
+      waitForEvent,
     }, input);
     } catch (error) {
       if (shouldFailRun(error)) {
@@ -592,6 +631,7 @@ function startHeartbeats(options: {
   points: ReturnType<typeof loadFailpointPlan>;
   barrierDir: string | undefined;
   heartbeatRequestPath: string | undefined;
+  apiKey: string | undefined;
   abort: AbortController;
   control: { lost: boolean };
 }): { stop: () => void } {
@@ -609,13 +649,18 @@ function startHeartbeats(options: {
           fence: options.fence,
         };
         if (options.heartbeatRequestPath) writeFileSync(options.heartbeatRequestPath, JSON.stringify(body));
-        await postJson(`${options.serverUrl}/worker/v1/heartbeat`, body);
+        await postJson(`${options.serverUrl}/worker/v1/heartbeat`, body, credentialHeader(options.apiKey));
         if (stopped) return;
         await hitFailpoint(options.points, "heartbeat.after-commit-before-response", { runId: options.runId }, options.barrierDir);
         if (stopped) return;
         current = options.schedule(options.intervalMs, tick);
       } catch (error) {
         if (stopped) return;
+        if (error instanceof WorkerHttpError && error.message.includes("run is terminal")) {
+          stopped = true;
+          options.abort.abort();
+          return;
+        }
         if (error instanceof WorkerHttpError && error.status === 409) {
           stopped = true;
           options.control.lost = true;
@@ -658,7 +703,7 @@ class WorkerHttpError extends Error {
 }
 
 async function postIntent(
-  options: { serverUrl: string },
+  options: { serverUrl: string; apiKey?: string },
   sessionId: string,
   runId: string,
   fence: string,
@@ -682,7 +727,7 @@ async function postIntent(
   return postJson(
     `${options.serverUrl}/worker/v1/events`,
     body,
-    activity ? { "x-relay-activity": activity } : undefined,
+    { ...(activity ? { "x-relay-activity": activity } : {}), ...credentialHeader(options.apiKey) },
   );
 }
 
@@ -691,7 +736,7 @@ function isComplete(intent: Json): boolean {
 }
 
 async function sendStreamBatch(
-  options: { serverUrl: string; barrierDir?: string },
+  options: { serverUrl: string; apiKey?: string; barrierDir?: string },
   control: { lost: boolean },
   points: Parameters<typeof hitFailpoint>[0],
   sessionId: string,
@@ -715,7 +760,7 @@ async function sendStreamBatch(
     attemptToken,
     batchSeq: String(batchSeq),
     text,
-  });
+  }, credentialHeader(options.apiKey));
   await hitFailpoint(points, "stream.after-batch-commit-before-response", { runId, stepKey, attempt }, options.barrierDir);
 }
 
@@ -740,15 +785,26 @@ async function postJson(
   return parsed;
 }
 
-async function getHistory(serverUrl: string, runId: string, sessionId: string, watermark: string): Promise<HistoryEvent[]> {
+async function getHistory(
+  serverUrl: string,
+  runId: string,
+  sessionId: string,
+  watermark: string,
+  apiKey: string | undefined,
+): Promise<HistoryEvent[]> {
   const url = new URL(`${serverUrl}/worker/v1/runs/${runId}/history`);
   url.searchParams.set("workerSessionId", sessionId);
   url.searchParams.set("after", "0");
   url.searchParams.set("through", watermark);
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: credentialHeader(apiKey) });
   if (!response.ok) throw new Error(`history failed ${response.status}: ${await response.text()}`);
   const body = await response.json() as { events: HistoryEvent[] };
   return body.events;
+}
+
+function credentialHeader(apiKey: string | undefined): { [key: string]: string } {
+  if (!apiKey) return {};
+  return { authorization: `Bearer ${apiKey}` };
 }
 
 function inputFromHistory(events: HistoryEvent[]): Json {
@@ -770,6 +826,13 @@ function indexCommands(events: HistoryEvent[]): CommandHistory[] {
         completed: helper && recorded,
         result: helper && recorded ? event.payload.outcome : undefined,
       };
+    }
+    if (event.type === "WaitResolved" && event.commandPos !== null) {
+      const command = commands[Number(event.commandPos)];
+      if (command) {
+        command.completed = true;
+        command.result = event.payload.result;
+      }
     }
     if (event.type === "TimerFired" && event.commandPos !== null) {
       const command = commands[Number(event.commandPos)];
@@ -933,6 +996,15 @@ function sameChildRetries(recorded: Json | undefined, expected: ChildRetry[]): b
     if (!child.explicitRetry) return row.retry === undefined;
     return sameRetry(row.retry, child.retry);
   });
+}
+
+function sameWait(
+  descriptor: { [key: string]: Json },
+  expected: { kind: "wait"; key: string; timeoutMs: number },
+): boolean {
+  return descriptor.kind === expected.kind
+    && descriptor.key === expected.key
+    && descriptor.timeoutMs === expected.timeoutMs;
 }
 
 function sameSleep(

@@ -34,6 +34,12 @@ export type WorkerIntent =
       expectedCommandPos: string;
     }
   | {
+      kind: "schedule_wait";
+      key: string;
+      timeoutMs: number;
+      expectedCommandPos: string;
+    }
+  | {
       kind: "start_attempt";
       stepKey: string;
     }

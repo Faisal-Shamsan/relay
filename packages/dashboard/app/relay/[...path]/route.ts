@@ -1,4 +1,4 @@
-import { serverUrl } from "../../../lib/api";
+import { clientKey, serverUrl } from "../../../lib/api";
 
 export const dynamic = "force-dynamic";
 
@@ -8,7 +8,10 @@ export async function GET(request: Request, context: { params: Promise<{ path: s
   const target = new URL(`${serverUrl()}/${path.join("/")}${incoming.search}`);
   const upstream = await fetch(target, {
     cache: "no-store",
-    headers: { accept: request.headers.get("accept") ?? "text/event-stream" },
+    headers: {
+      accept: request.headers.get("accept") ?? "text/event-stream",
+      authorization: `Bearer ${clientKey()}`,
+    },
   });
   const headers = new Headers();
   const type = upstream.headers.get("content-type");

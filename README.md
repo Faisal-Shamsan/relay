@@ -46,10 +46,12 @@ npm start
 
 `npm start` applies the SQL migrations with the admin URL, then listens on port 8080 as `relay_app`. The application role can read tables and call the Relay functions. It cannot write the tables directly.
 
+Migrations seed one local tenant and two keys. The client key is `relay_dev_client_key`. The worker key is `relay_dev_worker_key`. Send either as `Authorization: Bearer`. The database stores only the SHA-256 of a key. A client key can create, read, stream, signal, and cancel. A worker key can register, lease, heartbeat, and append. A missing or wrong-kind key is 401.
+
 Create a run:
 
 ```sh
-curl -s -X POST http://127.0.0.1:8080/v1/runs -H "content-type: application/json" -d "{\"workflowName\":\"demo\",\"workflowVersion\":\"demo-v1\",\"input\":{}}"
+curl -s -X POST http://127.0.0.1:8080/v1/runs -H "authorization: Bearer relay_dev_client_key" -H "content-type: application/json" -d "{\"workflowName\":\"demo\",\"workflowVersion\":\"demo-v1\",\"input\":{}}"
 ```
 
 Drive it with a worker. After `npm run build`, this completes one step:
@@ -63,19 +65,28 @@ const workflow = defineWorkflow({ name: "demo", version: "demo-v1" }, async (ctx
 
 await fetch("http://127.0.0.1:8080/v1/runs", {
   method: "POST",
-  headers: { "content-type": "application/json" },
+  headers: {
+    authorization: "Bearer relay_dev_client_key",
+    "content-type": "application/json",
+  },
   body: JSON.stringify({ workflowName: "demo", workflowVersion: "demo-v1", input: {} }),
 });
-console.log(await runActivation({ serverUrl: "http://127.0.0.1:8080", workflow }));
+console.log(await runActivation({
+  serverUrl: "http://127.0.0.1:8080",
+  apiKey: "relay_dev_worker_key",
+  workflow,
+}));
 ```
 
 Read it back:
 
 ```sh
-curl -s http://127.0.0.1:8080/v1/runs/<run-id>
-curl -s "http://127.0.0.1:8080/v1/runs/<run-id>/events?limit=100"
-curl -s http://127.0.0.1:8080/v1/workflows
+curl -s http://127.0.0.1:8080/v1/runs/<run-id> -H "authorization: Bearer relay_dev_client_key"
+curl -s "http://127.0.0.1:8080/v1/runs/<run-id>/events?limit=100" -H "authorization: Bearer relay_dev_client_key"
+curl -s http://127.0.0.1:8080/v1/workflows -H "authorization: Bearer relay_dev_client_key"
 ```
+
+The dashboard in `packages/dashboard` attaches the client key on the server. Set `RELAY_API_KEY` to that key. If it is unset, the dashboard uses `relay_dev_client_key`. The browser does not receive the key. `npm run dev` in that package also needs `RELAY_SERVER_URL`. The dashboard still has no database URL.
 
 Check projections without changing them:
 
@@ -96,10 +107,11 @@ node packages/server/dist/src/main.js projections rebuild <run-id>
 - A step callback can run more than once. A committed result is not run again. A fake provider may skip a repeated effect; Relay does not make the external call exactly once.
 - Without an explicit retry policy, a recorded callback failure is not retried. Crash recovery stops at the recovery budget stored on the step. The default is 100. An explicit `retry` policy stores one backoff, including its jitter, and that same deadline is what a later attempt uses.
 - Workers advertise an exact workflow version. A run pinned to v1 stays pending while only a v2 worker is alive.
+- At the same priority, a lease prefers the tenant that has waited longer since its last grant. A higher priority still comes first, so a lower-priority run can keep waiting. The two-tenant grant test showed that successive same-priority grants do not all go to the first tenant, and that a higher priority still comes first. That order is not a throughput result, and it is not a measurement of 1,000 runs, 10,000 runs, stream catch-up, or Postgres CPU.
 - Replay compares command shape. An explicit step input is fingerprinted, and a change is rejected before the stored result is returned. A changed captured value with the same command shape is not detected. `ctx.now`, `ctx.random`, and `ctx.uuid` record one server-generated value. Replay returns that value, and a different key at that position is rejected.
-- A worker can append a durable stream batch, and a client can resume that log over SSE. A finished run's stream log expires seven days after completion. The run result remains, and a later read returns 410. `ctx.sleep` records one database deadline and releases the worker until that deadline fires. `GET /v1/runs?state=failed` lists failed run rows. There is no signal or cancellation API.
+- A worker can append a durable stream batch, and a client can resume that log over SSE. A finished run's stream log expires seven days after completion. The run result remains, and a later read returns 410. `ctx.sleep` records one database deadline and releases the worker until that deadline fires. `ctx.waitForEvent(name, {timeoutMs})` parks until the oldest matching signal or that one deadline. `POST /v1/runs/:id/signal` stores an early signal. `POST /v1/runs/:id/cancel` races completion. `GET /v1/runs?state=failed` lists failed run rows.
 - `GET /v1/metrics` reports current run, pending-version, and live-worker gauges. It does not keep a cost series. A trace export is optional. If `RELAY_OTEL_ENDPOINT` is unset or the export fails, the transition still commits. The dashboard in `packages/dashboard` reads those HTTP APIs and the SSE stream. It does not open the database. `npm run dev` in that package needs `RELAY_SERVER_URL`.
-- The 100-run demo measures activation time and history bytes for that run. Stream catch-up, 1,000 runs, 10,000 runs, Postgres CPU, and a separate replay duration are not measured. The printed times are not a performance promise.
+- The 100-run demo measures activation time and history bytes for that run. Stream catch-up, 1,000 runs, 10,000 runs, Postgres CPU, and a separate replay duration are not measured. The two-tenant grant order is not one of those measurements. The printed times are not a performance promise.
 - `lintWorkflow` reports a direct `Date.now`, `Math.random`, `randomUUID`, `process.env`, `fetch`, `globalThis`, or `Promise.all` written outside a step. It reads the function source. It does not follow a call into another function. The same calls inside a step callback are allowed.
 - JSON follows the rules in `packages/protocol/src/json.ts`: the root counts as depth 1, unsafe integers are rejected, the receipt digest is SHA-256, and strings are not Unicode-normalized.
 - Invalid JSON is rejected with a path. It is not rewritten into a stored success.

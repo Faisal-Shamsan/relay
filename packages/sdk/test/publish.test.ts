@@ -29,10 +29,12 @@ const PUBLIC = [
   "lintWorkflow",
   "reduceStream",
   "runActivation",
+  "cancel",
+  "signal",
   "subscribe",
 ];
 
-const RESERVED = ["waitForEvent", "signal", "cancel", "loadFailpointPlan", "rebuild", "metrics"];
+const RESERVED = ["loadFailpointPlan", "rebuild", "metrics"];
 
 test("the sdk entry exports only the implemented surface", () => {
   const source = readFileSync(join(sdkDir, "src/index.ts"), "utf8");

@@ -64,6 +64,7 @@ export interface WorkflowContext {
   random(key: string): Promise<number>;
   uuid(key: string): Promise<string>;
   sleep(key: string, durationMs: number): Promise<void>;
+  waitForEvent(name: string, options: { timeoutMs: number }): Promise<Json>;
 }
 
 export interface WorkflowDefinition {

@@ -1,3 +1,4 @@
+export { cancel, signal } from "./client.js";
 export { lintWorkflow, type LintFinding, type LintRule } from "./lint.js";
 export {
   defineWorkflow,

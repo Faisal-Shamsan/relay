@@ -124,6 +124,14 @@ Initial ledger. Statements are taken from [spec.md](spec.md). No enforcing code 
 
 **How we expect to prove it.** F12, with F13 and F14 as the cases that are detected. The test must document the undetected case rather than treating it as a passed semantic guarantee.
 
+## INV-016
+
+**Statement.** A caller authenticated as one tenant cannot read, stream, or mutate another tenant's run.
+
+**Why it matters.** Tenant columns are not multi-tenancy until a credential selects the tenant and the database hides the rest. A missing run and another tenant's run look the same to the caller. Specification §1, §10.4, and §12.2 (F38).
+
+**How we expect to prove it.** F38. A client key for tenant B receives 404 for tenant A's run and stream. A worker key for B cannot lease or complete that run. `relay_app` with B's tenant setting cannot select A's rows. A direct table write by `relay_app` is still rejected.
+
 ## Correspondence to the specification ledger
 
 | This ledger | Specification §15 |
