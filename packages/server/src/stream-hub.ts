@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import pg from "pg";
-import { SEEDED_TENANT_ID, type Json } from "@relay/protocol";
+import type { Json } from "@relay/protocol";
+import { withTransaction } from "./db.js";
 import { decimalString, HttpError } from "./errors.js";
 
 const CHANNEL = "relay_stream";
@@ -28,7 +29,7 @@ interface Subscriber {
 
 export interface StreamHub {
   close(): Promise<void>;
-  serve(req: IncomingMessage, res: ServerResponse, runId: string, url: URL): Promise<void>;
+  serve(req: IncomingMessage, res: ServerResponse, runId: string, url: URL, tenantId: string): Promise<void>;
   suppressNotifications(): void;
 }
 
@@ -74,10 +75,10 @@ export async function createStreamHub(options: {
       for (const stopSubscriber of [...stops]) stopSubscriber();
       await listenClient.end();
     },
-    async serve(req, res, runId, url) {
+    async serve(req, res, runId, url, tenantId) {
       if (closed) throw new HttpError(404, "InvalidRunState", "run not found");
       const cursor = streamCursor(req, url);
-      const opened = await loadSnapshot(options.pool, runId, cursor);
+      const opened = await loadSnapshot(options.pool, runId, cursor, tenantId);
       if (!opened.found) throw new HttpError(404, "InvalidRunState", "run not found");
       if (opened.expired) {
         throw new HttpError(410, "StreamExpired", "stream history has expired", expiredDetails(runId, opened));
@@ -129,7 +130,7 @@ export async function createStreamHub(options: {
         await options.beforeCatchup?.(runId);
         while (!subscriber.closed) {
           subscriber.dirty = false;
-          const page = await loadSnapshot(options.pool, runId, subscriber.cursor);
+          const page = await loadSnapshot(options.pool, runId, subscriber.cursor, tenantId);
           if (subscriber.closed) return;
           if (page.expired) {
             const notice = `event: expired\ndata: ${JSON.stringify({
@@ -207,8 +208,8 @@ interface SnapshotRow {
   payload: Json | null;
 }
 
-async function loadSnapshot(pool: pg.Pool, runId: string, cursor: string): Promise<Snapshot> {
-  const result = await pool.query<SnapshotRow>(
+async function loadSnapshot(pool: pg.Pool, runId: string, cursor: string, tenantId: string): Promise<Snapshot> {
+  const result = await withTransaction(pool, async (client) => client.query<SnapshotRow>(
     `SELECT (r.stream_expired_at IS NOT NULL) AS expired,
             r.state,
             r.output,
@@ -227,8 +228,8 @@ async function loadSnapshot(pool: pg.Pool, runId: string, cursor: string): Promi
       AND e.seq > $3::bigint
      WHERE r.id = $1 AND r.tenant_id = $2
      ORDER BY e.seq`,
-    [runId, SEEDED_TENANT_ID, cursor],
-  );
+    [runId, tenantId, cursor],
+  ));
   const first = result.rows[0];
   if (!first) return { found: false, expired: false, state: "", output: null, error: null, high: "0", rows: [] };
   const rows = result.rows.flatMap((row) => {

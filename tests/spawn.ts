@@ -9,7 +9,7 @@ export function startWorker(env: NodeJS.ProcessEnv, entry = "packages/sdk/dist/s
   child: ChildProcess;
   done: Promise<{ code: number; stderr: string }>;
 } {
-  const child = spawn(process.execPath, [join(repoRoot, entry)], {
+  const child = spawn(process.execPath, ["--import", "./scripts/test-auth.mjs", join(repoRoot, entry)], {
     cwd: repoRoot,
     env: { ...process.env, ...env },
   });

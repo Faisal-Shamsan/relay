@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
   canonicalHash,
@@ -9,10 +9,9 @@ import {
   validateRelayJson,
   PROTOCOL_VERSION,
   RelayJsonError,
-  SEEDED_TENANT_ID,
   type Json,
 } from "@relay/protocol";
-import { callJson, createPool, withTransaction } from "./db.js";
+import { callJson, createPool, currentTenant, withTenant, withTransaction } from "./db.js";
 import { decimalString, fromDatabaseError, HttpError } from "./errors.js";
 import { createStreamHub, type StreamHub } from "./stream-hub.js";
 import { exportRequestSpan, type RequestSpan } from "./trace.js";
@@ -77,7 +76,15 @@ export async function startServer(options: {
       status: 500,
     };
     try {
-      await route(pool, stream, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId, span);
+      const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+      if (pathname.startsWith("/v1/") || pathname.startsWith("/worker/")) {
+        const tenantId = await authenticate(pool, req);
+        await withTenant(tenantId, () =>
+          route(pool, stream, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId, span),
+        );
+      } else {
+        await route(pool, stream, leaseDurationMs, heartbeatIntervalMs, recoveryBudget, req, res, requestId, span);
+      }
       span.status = res.statusCode || span.status;
     } catch (error) {
       const mapped = error instanceof HttpError ? error : error instanceof RelayJsonError
@@ -119,6 +126,7 @@ export async function startServer(options: {
   if (timerIntervalMs > 0) {
     const tick = () => {
       void fireDueTimers(pool, 32)
+        .then(() => fireDueWaits(pool, 32))
         .then(() => fireDueRetries(pool, 32))
         .catch((error: unknown) => {
           console.error("timer sweep failed", error);
@@ -152,6 +160,40 @@ export async function startServer(options: {
   };
 }
 
+async function authenticate(pool: ReturnType<typeof createPool>, req: IncomingMessage): Promise<string> {
+  const header = req.headers.authorization;
+  if (typeof header !== "string" || !header.startsWith("Bearer ")) {
+    throw new HttpError(401, "Unauthorized", "credential is not valid");
+  }
+  const token = header.slice("Bearer ".length).trim();
+  if (token.length < 8 || token.length > 256) {
+    throw new HttpError(401, "Unauthorized", "credential is not valid");
+  }
+  const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+  const expected = pathname.startsWith("/worker/") ? "worker" : "client";
+  const hash = createHash("sha256").update(token, "utf8").digest("hex");
+  const found = await pool.query<{ tenant_id: string; kind: string }>(
+    `SELECT tenant_id::text AS tenant_id, kind FROM relay_authenticate($1)`,
+    [hash],
+  );
+  const row = found.rows[0];
+  if (!row || row.kind !== expected) {
+    throw new HttpError(401, "Unauthorized", "credential is not valid");
+  }
+  return row.tenant_id;
+}
+
+function tenant(): string {
+  const value = currentTenant();
+  if (!value) throw new HttpError(401, "Unauthorized", "credential is not valid");
+  return value;
+}
+
+function rejectForeignTenant(body: Json): void {
+  if (!isJsonObject(body) || !("tenantId" in body) || body.tenantId === tenant()) return;
+  throw new HttpError(401, "Unauthorized", "credential is not valid");
+}
+
 async function route(
   pool: ReturnType<typeof createPool>,
   stream: StreamHub,
@@ -170,6 +212,7 @@ async function route(
   if (activity === "replay" || activity === "callback") span.activity = activity;
   if (req.method === "POST" && url.pathname === "/v1/runs") {
     const body = await readJson(req);
+    rejectForeignTenant(body);
     const workflowName = requiredString(body, "workflowName");
     const workflowVersion = requiredString(body, "workflowVersion");
     if (!("input" in body)) throw new HttpError(422, "Serialization", "input is required");
@@ -180,7 +223,7 @@ async function route(
     const result = await callJson(
       pool,
       `SELECT relay_create_run($1,$2,$3,$4::jsonb,$5,$6,$7) AS result`,
-      [SEEDED_TENANT_ID, workflowName, workflowVersion, JSON.stringify(input), triggerHash, runId, idempotencyKey],
+      [tenant(), workflowName, workflowVersion, JSON.stringify(input), triggerHash, runId, idempotencyKey],
     );
     const created = result as { runId?: unknown; created?: unknown } | null;
     if (typeof created !== "object" || created === null || Array.isArray(created) || typeof created.runId !== "string") {
@@ -208,7 +251,7 @@ async function route(
          FROM workflow_versions wv
          WHERE wv.tenant_id = $1
          ORDER BY wv.name, wv.version`,
-        [SEEDED_TENANT_ID],
+        [tenant()],
       );
       return listed.rows;
     });
@@ -237,7 +280,7 @@ async function route(
          ORDER BY r.created_at, r.id
          OFFSET $5::bigint
          LIMIT $6`,
-        [SEEDED_TENANT_ID, state, workflow, version, cursor, limit + 1],
+        [tenant(), state, workflow, version, cursor, limit + 1],
       );
       return listed.rows as Array<{
         runId: string;
@@ -276,7 +319,7 @@ async function route(
          JOIN workflow_versions wv ON wv.id = r.workflow_version_id
          LEFT JOIN run_queue q ON q.run_id = r.id
          WHERE r.id = $1 AND r.tenant_id = $2`,
-        [runId, SEEDED_TENANT_ID],
+        [runId, tenant()],
       );
       return found.rows[0] as {
         state: string;
@@ -315,7 +358,7 @@ async function route(
     if (!/^[0-9]+$/.test(after)) throw new HttpError(422, "Serialization", "after must be a decimal string");
     const limit = pageLimit(url.searchParams.get("limit"));
     const page = await withTransaction(pool, async (client) => {
-      const exists = await client.query(`SELECT 1 FROM runs WHERE id = $1 AND tenant_id = $2`, [runId, SEEDED_TENANT_ID]);
+      const exists = await client.query(`SELECT 1 FROM runs WHERE id = $1 AND tenant_id = $2`, [runId, tenant()]);
       if (exists.rowCount === 0) return null;
       const events = await client.query(
         `SELECT seq::text AS seq, fence::text AS fence, actor, type,
@@ -340,7 +383,7 @@ async function route(
     const runId = stepsMatch[1];
     if (runId === undefined) throw new HttpError(404, "InvalidRunState", "run not found");
     const page = await withTransaction(pool, async (client) => {
-      const exists = await client.query(`SELECT 1 FROM runs WHERE id = $1 AND tenant_id = $2`, [runId, SEEDED_TENANT_ID]);
+      const exists = await client.query(`SELECT 1 FROM runs WHERE id = $1 AND tenant_id = $2`, [runId, tenant()]);
       if (exists.rowCount === 0) return null;
       const steps = await client.query(
         `SELECT s.step_key AS "stepKey",
@@ -404,18 +447,56 @@ async function route(
   if (req.method === "GET" && streamMatch) {
     const runId = streamMatch[1];
     if (runId === undefined) throw new HttpError(404, "InvalidRunState", "run not found");
-    await stream.serve(req, res, runId, url);
+    await stream.serve(req, res, runId, url, tenant());
+    return;
+  }
+
+  const cancelMatch = /^\/v1\/runs\/([0-9a-fA-F-]{36})\/cancel$/.exec(url.pathname);
+  if (req.method === "POST" && cancelMatch) {
+    const runId = cancelMatch[1];
+    if (runId === undefined) throw new HttpError(404, "InvalidRunState", "run not found");
+    const body = await readJson(req);
+    requireProtocol(body);
+    sendJson(res, 200, await callJson(pool, `SELECT relay_cancel_run($1) AS result`, [runId]));
+    return;
+  }
+
+  const signalMatch = /^\/v1\/runs\/([0-9a-fA-F-]{36})\/signal$/.exec(url.pathname);
+  if (req.method === "POST" && signalMatch) {
+    const runId = signalMatch[1];
+    if (runId === undefined) throw new HttpError(404, "InvalidRunState", "run not found");
+    const body = await readJson(req);
+    const name = requiredString(body, "name");
+    if (Buffer.byteLength(name) > 256) throw new HttpError(422, "Serialization", "signal name length is invalid");
+    if (!("payload" in body)) throw new HttpError(422, "Serialization", "payload is required");
+    const payload = validateRelayJson(body.payload);
+    const idempotencyKey = requiredString(body, "idempotencyKey");
+    if (Buffer.byteLength(idempotencyKey) < 1 || Buffer.byteLength(idempotencyKey) > 256) {
+      throw new HttpError(422, "Serialization", "idempotency key length is invalid");
+    }
+    const result = await callJson(
+      pool,
+      `SELECT relay_accept_signal($1,$2,$3::jsonb,$4,$5) AS result`,
+      [runId, name, JSON.stringify(payload), canonicalHash(payload), idempotencyKey],
+    );
+    const stored = result as { replayed?: unknown; ingressSeq?: unknown; name?: unknown };
+    sendJson(res, stored.replayed === true ? 200 : 201, {
+      ingressSeq: stored.ingressSeq,
+      name: stored.name,
+      idempotencyKey,
+    });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/worker/v1/register") {
     const body = await readJson(req);
     requireProtocol(body);
+    rejectForeignTenant(body);
     const result = await callJson(
       pool,
       `SELECT relay_register_worker($1,$2,$3,$4,$5,$6::jsonb) AS result`,
       [
-        SEEDED_TENANT_ID,
+        tenant(),
         requiredString(body, "workerSessionId"),
         requiredString(body, "operationId"),
         canonicalHash(body),
@@ -523,6 +604,8 @@ async function route(
     decimalString(after, "after");
     decimalString(through, "through");
     const rows = await withTransaction(pool, async (client) => {
+      const visible = await client.query(`SELECT 1 FROM runs WHERE id = $1 AND tenant_id = $2`, [runId, tenant()]);
+      if (visible.rowCount === 0) throw new HttpError(404, "InvalidRunState", "run not found");
       const gate = await client.query(
         `SELECT s.history_watermark::text AS watermark, q.lease_owner::text AS owner, q.state
          FROM worker_sessions s
@@ -659,6 +742,25 @@ async function dispatchIntent(
         ctx.fence,
         helperKind,
         requiredString(intent, "key"),
+        decimalString(intent.expectedCommandPos, "expectedCommandPos"),
+        ctx.hash,
+      ],
+    );
+  }
+  if (kind === "schedule_wait") {
+    if (typeof intent.timeoutMs !== "number" || !Number.isSafeInteger(intent.timeoutMs) || intent.timeoutMs < 0) {
+      throw new HttpError(422, "Serialization", "timeoutMs must be a nonnegative safe integer");
+    }
+    return callJson(
+      pool,
+      `SELECT relay_declare_wait($1,$2,$3,$4::bigint,$5,$6::bigint,$7::bigint,$8) AS result`,
+      [
+        ctx.operationId,
+        ctx.sessionId,
+        ctx.runId,
+        ctx.fence,
+        requiredString(intent, "key"),
+        String(intent.timeoutMs),
         decimalString(intent.expectedCommandPos, "expectedCommandPos"),
         ctx.hash,
       ],
@@ -874,6 +976,7 @@ async function readJson(req: IncomingMessage): Promise<{ [key: string]: Json }> 
     throw new HttpError(422, "Serialization", "JSON object is required");
   }
   canonicalRelayJson(parsed);
+  rejectForeignTenant(parsed);
   return parsed;
 }
 
@@ -905,6 +1008,13 @@ async function expireDueStreams(pool: ReturnType<typeof createPool>, horizonMs: 
 async function fireDueRetries(pool: ReturnType<typeof createPool>, limit: number): Promise<void> {
   for (let n = 0; n < limit; n += 1) {
     const status = await callJson(pool, `SELECT relay_fire_one_retry() AS result`, []);
+    if (status !== "fired") return;
+  }
+}
+
+async function fireDueWaits(pool: ReturnType<typeof createPool>, limit: number): Promise<void> {
+  for (let n = 0; n < limit; n += 1) {
+    const status = await callJson(pool, `SELECT relay_fire_one_wait() AS result`, []);
     if (status !== "fired") return;
   }
 }
@@ -986,7 +1096,7 @@ async function metricsText(pool: ReturnType<typeof createPool>): Promise<string>
        LEFT JOIN runs r ON r.state = s.state AND r.tenant_id = $1
        GROUP BY s.state
        ORDER BY s.state`,
-      [SEEDED_TENANT_ID],
+      [tenant()],
     );
     const versions = await client.query<{
       workflow: string;
@@ -1008,7 +1118,7 @@ async function metricsText(pool: ReturnType<typeof createPool>): Promise<string>
        FROM workflow_versions wv
        WHERE wv.tenant_id = $1
        ORDER BY wv.name, wv.version`,
-      [SEEDED_TENANT_ID],
+      [tenant()],
     );
     return { states: states.rows, versions: versions.rows };
   });

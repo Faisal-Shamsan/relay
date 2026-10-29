@@ -4,7 +4,7 @@ import test from "node:test";
 import pg from "pg";
 import { SEEDED_TENANT_ID } from "@relay/protocol";
 import { reduceStream, subscribe, type StreamEvent } from "@relay/sdk";
-import { createTestDatabase, startServer, type StartedServer } from "relay-server";
+import { createTestDatabase, DEV_CLIENT_KEY, startServer, type StartedServer } from "relay-server";
 
 test("F29 a reconnect across supersession matches the client that stayed connected", { timeout: 20_000 }, async () => {
   const db = await createTestDatabase();
@@ -171,7 +171,10 @@ test("F31 a slow client is disconnected without blocking a later batch", { timeo
     const second = await post(server.url, "/worker/v1/stream", streamBody(open, "1", "overflow"));
     assert.equal(second.status, 200);
     const closed = new Promise<void>((resolve, reject) => {
-      const request = http.get(`${server.url}/v1/runs/${open.runId}/stream`, (response) => {
+      const request = http.get(
+        `${server.url}/v1/runs/${open.runId}/stream`,
+        { headers: { authorization: `Bearer ${DEV_CLIENT_KEY}` } },
+        (response) => {
         assert.equal(response.statusCode, 200);
         response.pause();
         response.on("close", () => resolve());
