@@ -57,3 +57,63 @@ test("a completed step replays from history without calling the user function ag
     await db.drop();
   }
 });
+
+test("ten completed steps replay after the event sequence passes 9", async () => {
+  const db = await createTestDatabase();
+  const server = await startServer({ appDatabaseUrl: db.appUrl, leaseDurationMs: 30_000, reaperIntervalMs: 0 });
+  const admin = new pg.Client({ connectionString: db.adminUrl });
+  await admin.connect();
+  const steps = 10;
+  let calls = 0;
+  const workflow = defineWorkflow({ name: "demo", version: "replay-10" }, async (ctx) => {
+    let last = 0;
+    for (let i = 0; i < steps; i += 1) {
+      const stored = await ctx.step(`s${i}`, async () => {
+        calls += 1;
+        return i;
+      });
+      if (typeof stored !== "number") throw new Error(`step s${i} stored ${JSON.stringify(stored)}`);
+      last = stored;
+    }
+    return last;
+  });
+  try {
+    await fetch(`${server.url}/worker/v1/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        protocolVersion: 1,
+        operationId: crypto.randomUUID(),
+        workerSessionId: crypto.randomUUID(),
+        tenantId: SEEDED_TENANT_ID,
+        workflows: [{ name: "demo", version: "replay-10" }],
+      }),
+    });
+    const created = await fetch(`${server.url}/v1/runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workflowName: "demo", workflowVersion: "replay-10", input: { steps } }),
+    });
+    assert.equal(created.status, 201);
+    const runId = String((await created.json() as { runId: string }).runId);
+    assert.equal(await runActivation({ serverUrl: server.url, workflow, finishRun: false }), steps - 1);
+    assert.equal(calls, steps);
+    await admin.query(
+      `UPDATE run_queue SET lease_expires_at = clock_timestamp() - interval '1 millisecond' WHERE run_id = $1`,
+      [runId],
+    );
+    await admin.query(`SELECT relay_expire_lease($1)`, [runId]);
+    assert.equal(await runActivation({ serverUrl: server.url, workflow, finishRun: true }), steps - 1);
+    assert.equal(calls, steps);
+    const listed = await fetch(`${server.url}/v1/runs/${runId}/events?limit=100`);
+    assert.equal(listed.status, 200);
+    const body = await listed.json() as { events: Array<{ seq: string }> };
+    const seqs = body.events.map((event) => BigInt(event.seq));
+    assert.equal(seqs.length > 9, true);
+    for (let i = 1; i < seqs.length; i += 1) assert.equal(seqs[i]! > seqs[i - 1]!, true);
+  } finally {
+    await admin.end();
+    await server.close();
+    await db.drop();
+  }
+});

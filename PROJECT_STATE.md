@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 4 milestones M21 through M26 have passed. The three-minute debugging recording is still a manual check. Phase 5 is not started.
+Phase 5 is in progress. M27 and M28 have passed. M29 is not started. The three-minute debugging recording is still a manual check.
 
 ## Completed
 
@@ -35,6 +35,8 @@ Phase 4 milestones M21 through M26 have passed. The three-minute debugging recor
 - M24: named waits. `ctx.waitForEvent(name, {timeoutMs})` is one top-level command. An early signal is consumed oldest-first, and a second signal of that name stays. A zero timeout with no signal records one timeout and does not park. A signal and a firing scheduler produce one `WaitResolved`. A second fire does not write another. Replay returns the stored result and does not park again. A wait inside a step callback is rejected. The proof is `tests/waits.test.ts`.
 - M25: cancellation versus completion. If completion commits first, cancel returns that completed run and writes no `RunCancelled`. If cancel commits first, the run is `cancelled`, output and error stay null, the queue row is removed, the unfinished attempt is abandoned, and one `run_terminal` stream control is written. The later completion is rejected. History remains readable. A callback may already have performed an external effect; cancellation does not undo it. The callback's existing abort signal is the cooperative abort. Timer, retry, and wait firing do not wake a cancelled run. F37 is `tests/waits.test.ts` and `tests/cancel.test.ts`.
 - M26: one workflow waits for an approval signal and then finishes. That proof is `tests/approval.test.ts`. The README records the local client and worker keys, the dashboard `RELAY_API_KEY`, and the two-tenant grant result. Stream catch-up, 1,000 runs, 10,000 runs, and Postgres CPU are not measured.
+- M27: records that match the code. The study notes for `97cf173` now describe tenant keys, fairness, signals, waits, and cancellation. `docs/architecture.md` matches that behavior and still says Compose and the example app are absent. `CHANGELOG.md` records the user-visible Phase 4 behavior. `docs/adr/README.md` points 0001–0016 at the spec register and lists the written ADRs 0017 and 0018. No engine behavior changed.
+- M28: measured capacity. `npm run capacity` is separate from `npm test`. On this machine it replayed 10, 100, 1,000, and 10,000 commands and activated 100, 1,000, and 10,000 one-step runs. The numbers, hardware, and Postgres version are in `docs/capacity.md`. Replay did not call the step function again. Stream catch-up completed for the 10-command history. Longer streams closed the SSE connection, and those catch-up times are not measured. Worker history and `GET /v1/runs/:id/events` order by the numeric event sequence. The proof is `tests/replay.test.ts`.
 
 ## In progress
 
@@ -60,13 +62,13 @@ Phase 1 hooks for grant, heartbeat, declaration, and completion abort the open t
 
 ## Known issues
 
-- Stream catch-up, 1,000 runs, 10,000 runs, Postgres CPU, and a separate replay duration are not measured.
+- Stream catch-up past the 10-command history is not measured. The SSE connection closes once 32 frames are queued.
 - Recorded JSON ambiguities remain: the root counts as depth 1; unsafe integers are rejected rather than rewritten; SHA-256 is the receipt digest; no Unicode normalization.
 - External effects are at least once. Provider deduplication is not an exactly-once guarantee.
 
 ## Next milestone
 
-Phase 5 is not started. Do not start it until asked.
+M29 is not started. Do not start it until asked.
 
 ## Next task
 

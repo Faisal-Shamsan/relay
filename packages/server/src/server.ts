@@ -365,7 +365,7 @@ async function route(
                 command_pos::text AS "commandPos", step_key AS "stepKey", attempt, payload
          FROM run_events
          WHERE run_id = $1 AND seq > $2::bigint
-         ORDER BY seq
+         ORDER BY run_events.seq
          LIMIT $3`,
         [runId, after, limit + 1],
       );
@@ -622,7 +622,7 @@ async function route(
                 command_pos::text AS "commandPos", payload
          FROM run_events
          WHERE run_id = $1 AND seq > $2::bigint AND seq <= $3::bigint
-         ORDER BY seq`,
+         ORDER BY run_events.seq`,
         [runId, after, through],
       );
       return events.rows;
