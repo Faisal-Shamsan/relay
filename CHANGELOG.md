@@ -8,3 +8,4 @@
 - `POST /v1/runs/:id/cancel` races completion. The winner is the only terminal record. A later worker write is rejected. An effect the callback already performed is not undone.
 - The dashboard attaches `RELAY_API_KEY` on the server. The browser does not receive the key.
 - Worker history and the public event list are ordered by the numeric event sequence.
+- `POST /v1/runs/:id/redrive` starts a new run from a terminal run. The same idempotency key and body return that new run. The original run stays terminal and gains no event.

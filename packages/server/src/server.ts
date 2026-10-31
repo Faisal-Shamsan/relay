@@ -451,6 +451,45 @@ async function route(
     return;
   }
 
+  const redriveMatch = /^\/v1\/runs\/([0-9a-fA-F-]{36})\/redrive$/.exec(url.pathname);
+  if (req.method === "POST" && redriveMatch) {
+    const runId = redriveMatch[1];
+    if (runId === undefined) throw new HttpError(404, "InvalidRunState", "run not found");
+    const body = await readJson(req);
+    const idempotencyKey = requiredString(body, "idempotencyKey");
+    if (Buffer.byteLength(idempotencyKey) < 1 || Buffer.byteLength(idempotencyKey) > 256) {
+      throw new HttpError(422, "Serialization", "idempotency key length is invalid");
+    }
+    const inputPresent = "input" in body;
+    const input = inputPresent ? validateRelayJson(body.input) : null;
+    const requestHash = canonicalHash(inputPresent ? { idempotencyKey, input } : { idempotencyKey });
+    let triggerHash: string | null = null;
+    if (inputPresent) {
+      const meta = await withTransaction(pool, async (client) => {
+        const found = await client.query<{ name: string; version: string }>(
+          `SELECT wv.name, wv.version
+           FROM runs r
+           JOIN workflow_versions wv ON wv.id = r.workflow_version_id
+           WHERE r.id = $1`,
+          [runId],
+        );
+        return found.rows[0] ?? null;
+      });
+      if (meta) triggerHash = canonicalHash([meta.name, meta.version, input]);
+    }
+    const result = await callJson(
+      pool,
+      `SELECT relay_redrive_run($1,$2,$3,$4::jsonb,$5,$6) AS result`,
+      [runId, idempotencyKey, requestHash, inputPresent ? JSON.stringify(input) : null, inputPresent, triggerHash],
+    );
+    const stored = result as { runId?: unknown; created?: unknown } | null;
+    if (typeof stored !== "object" || stored === null || Array.isArray(stored) || typeof stored.runId !== "string") {
+      throw new Error("redrive response was not an object");
+    }
+    sendJson(res, stored.created === false ? 200 : 201, { runId: stored.runId });
+    return;
+  }
+
   const cancelMatch = /^\/v1\/runs\/([0-9a-fA-F-]{36})\/cancel$/.exec(url.pathname);
   if (req.method === "POST" && cancelMatch) {
     const runId = cancelMatch[1];
