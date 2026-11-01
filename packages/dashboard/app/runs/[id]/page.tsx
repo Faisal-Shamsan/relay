@@ -1,4 +1,5 @@
 import { readJson, type HistoryEvent, type RunDetail, type StepView } from "../../../lib/api";
+import { RunActions } from "./actions";
 import { StreamView } from "./stream-view";
 
 export default async function RunPage({ params }: { params: Promise<{ id: string }> }) {
@@ -29,6 +30,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
       </p>
       {run.output !== null ? <pre>{JSON.stringify(run.output, null, 2)}</pre> : null}
       {run.error !== null ? <pre>{JSON.stringify(run.error, null, 2)}</pre> : null}
+      <RunActions runId={run.runId} />
       <h2>Steps</h2>
       <table>
         <thead>

@@ -12,7 +12,7 @@ This page restates the ownership model in [spec.md](spec.md) §1. It does not ad
 
 **`relay-server`.** Public read API, versioned worker protocol, scheduler, lease reaper, and SSE fan-out. It validates requests, performs transitions, allocates sequences, checks ownership, routes work, and serves reads. It does not own user workflow code or provider-specific semantics. The server image contains no user code. Multiple server processes may share one database.
 
-**`relay-dashboard`.** Inspection and presentation through the server read API and SSE. It does not hold direct database credentials or a second authorization rule. The server-side proxy attaches `RELAY_API_KEY`. The browser does not receive that key.
+**`relay-dashboard`.** Inspection, and signal, cancel, and redrive, through the server HTTP API and SSE. It does not hold direct database credentials or a second authorization rule. The server-side proxy attaches `RELAY_API_KEY`. The browser does not receive that key.
 
 **PostgreSQL.** Durable commits, constraints, row locking, and authoritative time. It does not deliver external side effects. The database is reachable by the server and by migration tooling, not by browsers or SDK clients.
 
