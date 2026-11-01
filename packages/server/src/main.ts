@@ -34,10 +34,13 @@ const port = process.env.PORT === undefined ? 8080 : Number(process.env.PORT);
 if (!Number.isInteger(port) || port < 0 || port > 65535) {
   throw new Error("PORT must be an integer from 0 to 65535");
 }
+const host = process.env.RELAY_HOST ?? "127.0.0.1";
+if (host.trim() === "") throw new Error("RELAY_HOST is empty");
 const server = await startServer({
   appDatabaseUrl: app,
   leaseDurationMs: 30_000,
   port,
+  host,
   traceEndpoint: process.env.RELAY_OTEL_ENDPOINT,
 });
 console.log(server.url);

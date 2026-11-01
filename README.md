@@ -88,6 +88,14 @@ curl -s http://127.0.0.1:8080/v1/workflows -H "authorization: Bearer relay_dev_c
 
 The dashboard in `packages/dashboard` attaches the client key on the server. Set `RELAY_API_KEY` to that key. If it is unset, the dashboard uses `relay_dev_client_key`. The browser does not receive the key. `npm run dev` in that package also needs `RELAY_SERVER_URL`. The dashboard still has no database URL.
 
+Compose starts Postgres, the server, and the dashboard. Postgres stays on the Compose network and this file does not add a database password. The server image does not contain workflow code. From the repository root:
+
+```sh
+docker compose up --build
+```
+
+The server listens on port 8080 and the dashboard on port 3000. The approval worker is a separate process. Its signal and cancel commands are in [examples/approval/README.md](examples/approval/README.md).
+
 Check projections without changing them:
 
 ```sh
@@ -126,11 +134,55 @@ console.log(lintWorkflow(workflow.fn));
 
 `@relay/sdk` and `@relay/protocol` are the publishable packages, at version 0.1.0. `npm pack` in each package directory, after `npm run build`, includes the built entry and its type declarations. The server package is not published.
 
+## Recording
+
+The three-minute recording is made by hand. This repository does not generate it. The scene is one crashed attempt, the history of that crash, and the attempt that finishes the run.
+
+1. Start the server with Compose or `npm start`.
+2. Save this worker as `record.mjs`. Run `node record.mjs` once before any run exists. It registers `demo-v1` and then exits because no run is ready. That exit is expected.
+
+```javascript
+import { defineWorkflow, runActivation } from "@relay/sdk";
+
+const workflow = defineWorkflow({ name: "demo", version: "demo-v1" }, async (ctx) => {
+  return ctx.step("only", async () => {
+    if (process.env.RELAY_CRASH === "1") process.exit(1);
+    return { ok: true };
+  });
+});
+
+console.log(await runActivation({
+  serverUrl: "http://127.0.0.1:8080",
+  apiKey: "relay_dev_worker_key",
+  workflow,
+}));
+```
+
+3. Create a run with the `demo` / `demo-v1` body from above. Keep the run id.
+4. Run `$env:RELAY_CRASH = "1"; node record.mjs` (PowerShell) or `RELAY_CRASH=1 node record.mjs`. The process exits inside the step, before completion is sent.
+5. Read the history. It contains `StepStarted` for that attempt and does not contain `RunCompleted`. `RELAY_CLIENT_KEY` is the local client key named above.
+
+```sh
+curl -s "http://127.0.0.1:8080/v1/runs/<run-id>/events?limit=100" -H "authorization: Bearer $RELAY_CLIENT_KEY"
+```
+
+6. Wait for the 30-second lease to expire. Read the history again. `LeaseExpired` is now present, and the run is not completed.
+7. Run `node record.mjs` without `RELAY_CRASH`. The next attempt finishes the step and the run.
+8. Read the history again. The first `StepStarted` is still there, and the later attempt ends in `RunCompleted`.
+
 ## Failover
 
 Relay uses one Postgres primary. A response means that transaction committed. With Postgres `synchronous_commit` left at its default, `on`, that commit is durable on the primary. Relay does not ship a replica. If you add an async replica, its lag is your recovery point, and Relay does not measure that lag.
 
 A crash can lose a transaction that had not committed. If a request ends without a response, do not assume it rolled back and do not send a new operation id. Read the receipt or `GET /v1/runs/<id>/events`. The same operation id returns the stored result when the commit won, and performs the transition when it did not.
+
+## Closeout
+
+Phase 5 is the last phase. The specification roadmap stops at Phase 4.
+
+`docs/capacity.md` records the levels this machine finished: replay of 10, 100, 1,000, and 10,000 commands, and activation of 100, 1,000, and 10,000 one-step runs. Stream catch-up was measured for the 10-command history, at 23.8 ms. Catch-up of the 100, 1,000, and 10,000 command histories was not measured, because the SSE connection closes once 32 frames are queued.
+
+A step callback can run more than once. A committed result is not run again. External effects stay at least once. At the same priority, a lease prefers the tenant that has waited longer, and a higher priority still comes first, so a lower-priority run can keep waiting. JSON still counts the root as depth 1, rejects unsafe integers, uses SHA-256 as the receipt digest, and does not normalize Unicode.
 
 ## License
 

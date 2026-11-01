@@ -30,6 +30,7 @@ export async function startServer(options: {
   timerIntervalMs?: number;
   recoveryBudget?: number;
   port?: number;
+  host?: string;
   streamPollMs?: number;
   streamKeepaliveMs?: number;
   streamQueueLimit?: number;
@@ -104,7 +105,7 @@ export async function startServer(options: {
   });
 
   await new Promise<void>((resolve) => {
-    server.listen(options.port ?? 0, "127.0.0.1", () => resolve());
+    server.listen(options.port ?? 0, options.host ?? "127.0.0.1", () => resolve());
   });
   const address = server.address();
   if (address === null || typeof address === "string") {
