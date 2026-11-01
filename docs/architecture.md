@@ -29,7 +29,7 @@ This page restates the ownership model in [spec.md](spec.md) §1. It does not ad
 | SDK worker | Workflow execution, replay checking, callback isolation, buffering, provider calls | Database access or lease authority |
 | Server | Validation, transitions, sequence allocation, ownership, routing, scheduling, reads | User workflow code or provider-specific semantics |
 | PostgreSQL | Durable commits, constraints, row locking, authoritative time | Delivery of external side effects |
-| Dashboard | Inspection and presentation through server APIs | Direct database credentials or separate authorization rules |
+| Dashboard | Inspection, signal, cancel, and redrive through server APIs | Direct database credentials or separate authorization rules |
 
 ## Stored responsibilities
 
@@ -45,4 +45,4 @@ These are the specification's storage responsibilities, not a migration or packa
 
 Business projections are rebuildable from workflow history. Fence, sequence allocators, live lease deadlines, queue availability, request receipts, retention markers, and `last_granted_at` are coordination state. Rebuilding a timeline must not resurrect a live lease, lower a fence, rewind a sequence counter, delete a deduplication receipt, or move a tenant's last grant time.
 
-A caller authenticated as one tenant cannot read, stream, or mutate another tenant's run. A missing run and another tenant's run look the same. Public internet exposure and untrusted worker registration are still not a supported deployment. The specification says Compose starts Postgres and the server, and a documented example application starts its SDK workers separately. This repository does not yet contain those artifacts. Same-priority grants prefer the tenant that has waited longer. A higher priority still comes first. Signals, waits, and cancellation are implemented. A terminal run does not become runnable again. Explicit redrive creates a new run with the same pinned version and leaves the original run terminal.
+A caller authenticated as one tenant cannot read, stream, or mutate another tenant's run. A missing run and another tenant's run look the same. Public internet exposure and untrusted worker registration are still not a supported deployment. Compose starts Postgres, the server, and the dashboard. The approval example starts its SDK worker separately, and that workflow is not in the server image. Same-priority grants prefer the tenant that has waited longer. A higher priority still comes first. Signals, waits, and cancellation are implemented. A terminal run does not become runnable again. Explicit redrive creates a new run with the same pinned version and leaves the original run terminal.

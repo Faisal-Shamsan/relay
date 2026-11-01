@@ -10,3 +10,4 @@
 - Worker history and the public event list are ordered by the numeric event sequence.
 - `POST /v1/runs/:id/redrive` starts a new run from a terminal run. The same idempotency key and body return that new run. The original run stays terminal and gains no event.
 - The dashboard run page can signal, cancel, and redrive through the server proxy. The browser does not receive the API key.
+- Compose starts Postgres, the server, and the dashboard. The approval worker runs outside the server image.

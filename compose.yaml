@@ -1,0 +1,52 @@
+# Local stack. Postgres is only on the Compose network. The application role is
+# created by the existing migration. This file does not set a database password.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: relay
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d relay"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  server:
+    build:
+      context: .
+      dockerfile: deploy/server.Dockerfile
+    environment:
+      RELAY_ADMIN_URL: postgres://postgres@postgres:5432/relay
+      RELAY_DATABASE_URL: postgres://relay_app@postgres:5432/relay
+      RELAY_HOST: 0.0.0.0
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/v1/workflows',{headers:{authorization:'Bearer relay_dev_client_key'}}).then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: deploy/dashboard.Dockerfile
+    environment:
+      RELAY_SERVER_URL: http://server:8080
+      RELAY_API_KEY: relay_dev_client_key
+    ports:
+      - "3000:3000"
+    depends_on:
+      server:
+        condition: service_healthy
