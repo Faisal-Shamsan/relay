@@ -160,10 +160,10 @@ console.log(await runActivation({
 
 3. Create a run with the `demo` / `demo-v1` body from above. Keep the run id.
 4. Run `$env:RELAY_CRASH = "1"; node record.mjs` (PowerShell) or `RELAY_CRASH=1 node record.mjs`. The process exits inside the step, before completion is sent.
-5. Read the history. It contains `StepStarted` for that attempt and does not contain `RunCompleted`.
+5. Read the history. It contains `StepStarted` for that attempt and does not contain `RunCompleted`. `RELAY_CLIENT_KEY` is the local client key named above.
 
 ```sh
-curl -s "http://127.0.0.1:8080/v1/runs/<run-id>/events?limit=100" -H "authorization: Bearer relay_dev_client_key"
+curl -s "http://127.0.0.1:8080/v1/runs/<run-id>/events?limit=100" -H "authorization: Bearer $RELAY_CLIENT_KEY"
 ```
 
 6. Wait for the 30-second lease to expire. Read the history again. `LeaseExpired` is now present, and the run is not completed.
