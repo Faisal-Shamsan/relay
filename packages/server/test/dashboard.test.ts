@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-test("the dashboard source stays on the read API", () => {
+test("the dashboard source stays on the server API", () => {
   const root = dashboardRoot();
   const files = walk(root);
   assert.equal(files.length > 0, true);
@@ -21,7 +21,18 @@ test("the dashboard source stays on the read API", () => {
     for (const pattern of forbidden) {
       assert.equal(pattern.test(text), false, `${file} matches ${pattern}`);
     }
+    if (text.includes('"use client"') || text.includes("'use client'")) {
+      assert.equal(/RELAY_API_KEY|relay_dev_client_key|clientKey\(/.test(text), false, file);
+    }
   }
+  const actions = readFileSync(join(root, "app", "runs", "[id]", "actions.tsx"), "utf8");
+  assert.match(actions, /\/relay\/v1\/runs\/\$\{runId\}\/\$\{action\}/);
+  assert.match(actions, /"signal"/);
+  assert.match(actions, /"cancel"/);
+  assert.match(actions, /"redrive"/);
+  const proxy = readFileSync(join(root, "app", "relay", "[...path]", "route.ts"), "utf8");
+  assert.match(proxy, /export async function POST/);
+  assert.match(proxy, /clientKey\(\)/);
 });
 
 function dashboardRoot(): string {
