@@ -2,7 +2,7 @@
 
 > Current architecture summary. The technical specification remains authoritative.
 
-This page restates the ownership model in [spec.md](spec.md) §1. It does not add modules, package layouts, or deployment files.
+This page restates the ownership model in [spec.md](spec.md) §1 and the current deployment boundary. It does not add a package layout.
 
 ## Components
 

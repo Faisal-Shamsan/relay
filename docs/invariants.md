@@ -1,6 +1,6 @@
 # Invariants
 
-Initial ledger. Statements are taken from [spec.md](spec.md). No enforcing code or regression tests exist yet.
+Statements are taken from [spec.md](spec.md). The proofs named below are the tests in [test-matrix.md](test-matrix.md).
 
 `INV-001` through `INV-008` are the bootstrap set. `INV-009` through `INV-015` are the remaining claims from the specification's initial ledger (§15), kept so this file does not drop a specified claim. The correspondence is listed at the end.
 
