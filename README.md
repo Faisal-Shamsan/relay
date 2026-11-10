@@ -1,10 +1,10 @@
 # Relay
 
-Status: early development. APIs will change. Not for production use.
+Status: the planned phases are complete. Relay is a self-hostable demonstration of durable execution, not a production-parity claim. Public internet exposure and untrusted worker registration are not a supported deployment.
 
-Relay is a self-hostable TypeScript durable-execution engine. [docs/spec.md](docs/spec.md) is authoritative. [PROJECT.md](PROJECT.md) says what the project is for. This file is how to run the Phase 1 server.
+Relay is a self-hostable TypeScript durable-execution engine. [docs/spec.md](docs/spec.md) is authoritative. [PROJECT.md](PROJECT.md) says what the project is for. This file is how to run the server.
 
-Phase 1 stores workflow history in one Postgres database and recovers a crashed worker from that history. It does not claim exactly-once side effects.
+Relay stores workflow history in one Postgres database and recovers a crashed worker from that history. It does not claim exactly-once side effects.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ npm install
 npm test
 ```
 
-`npm test` starts the local Postgres container if needed, builds the packages, and runs the suite against real databases. The failure demo prints a ledger. The activation times and the history-byte total are measurements from that 100-run, not a performance promise. Stream catch-up, 1,000 runs, 10,000 runs, Postgres CPU, and a separate replay duration are not measured.
+`npm test` starts the local Postgres container if needed, builds the packages, and runs the suite against real databases. The failure demo prints a ledger. The activation times and the history-byte total are measurements from that 100-run. That ledger is not the capacity report, and its printed times are not a throughput promise. Replay of 10, 100, 1,000, and 10,000 commands, and activation of 100, 1,000, and 10,000 one-step runs, are in [docs/capacity.md](docs/capacity.md). Stream catch-up past the 10-command history is not measured, because the SSE connection closes once 32 frames are queued.
 
 To reprint the demo ledger:
 
@@ -115,11 +115,11 @@ node packages/server/dist/src/main.js projections rebuild <run-id>
 - A step callback can run more than once. A committed result is not run again. A fake provider may skip a repeated effect; Relay does not make the external call exactly once.
 - Without an explicit retry policy, a recorded callback failure is not retried. Crash recovery stops at the recovery budget stored on the step. The default is 100. An explicit `retry` policy stores one backoff, including its jitter, and that same deadline is what a later attempt uses.
 - Workers advertise an exact workflow version. A run pinned to v1 stays pending while only a v2 worker is alive.
-- At the same priority, a lease prefers the tenant that has waited longer since its last grant. A higher priority still comes first, so a lower-priority run can keep waiting. The two-tenant grant test showed that successive same-priority grants do not all go to the first tenant, and that a higher priority still comes first. That order is not a throughput result, and it is not a measurement of 1,000 runs, 10,000 runs, stream catch-up, or Postgres CPU.
+- At the same priority, a lease prefers the tenant that has waited longer since its last grant. A higher priority still comes first, so a lower-priority run can keep waiting. The two-tenant grant test showed that successive same-priority grants do not all go to the first tenant, and that a higher priority still comes first. That order is not a throughput result. The grant test is not the capacity report in [docs/capacity.md](docs/capacity.md).
 - Replay compares command shape. An explicit step input is fingerprinted, and a change is rejected before the stored result is returned. A changed captured value with the same command shape is not detected. `ctx.now`, `ctx.random`, and `ctx.uuid` record one server-generated value. Replay returns that value, and a different key at that position is rejected.
 - A worker can append a durable stream batch, and a client can resume that log over SSE. A finished run's stream log expires seven days after completion. The run result remains, and a later read returns 410. `ctx.sleep` records one database deadline and releases the worker until that deadline fires. `ctx.waitForEvent(name, {timeoutMs})` parks until the oldest matching signal or that one deadline. `POST /v1/runs/:id/signal` stores an early signal. `POST /v1/runs/:id/cancel` races completion. `GET /v1/runs?state=failed` lists failed run rows.
 - `GET /v1/metrics` reports current run, pending-version, and live-worker gauges. It does not keep a cost series. A trace export is optional. If `RELAY_OTEL_ENDPOINT` is unset or the export fails, the transition still commits. The dashboard in `packages/dashboard` reads those HTTP APIs and the SSE stream, and its run page posts signal, cancel, and redrive through the same server proxy. It does not open the database. `npm run dev` in that package needs `RELAY_SERVER_URL`.
-- The 100-run demo measures activation time and history bytes for that run. Stream catch-up, 1,000 runs, 10,000 runs, Postgres CPU, and a separate replay duration are not measured. The two-tenant grant order is not one of those measurements. The printed times are not a performance promise.
+- The 100-run demo measures activation time and history bytes for that run. That ledger is not the capacity report, and its printed times are not a throughput promise. Replay and run activation at the measured levels are in [docs/capacity.md](docs/capacity.md). Stream catch-up past the 10-command history is not measured, because the SSE connection closes once 32 frames are queued. The two-tenant grant order is not one of those measurements.
 - `lintWorkflow` reports a direct `Date.now`, `Math.random`, `randomUUID`, `process.env`, `fetch`, `globalThis`, or `Promise.all` written outside a step. It reads the function source. It does not follow a call into another function. The same calls inside a step callback are allowed.
 - JSON follows the rules in `packages/protocol/src/json.ts`: the root counts as depth 1, unsafe integers are rejected, the receipt digest is SHA-256, and strings are not Unicode-normalized.
 - Invalid JSON is rejected with a path. It is not rewritten into a stored success.
